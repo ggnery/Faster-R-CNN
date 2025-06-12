@@ -5,6 +5,19 @@ import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tensor, anchors_or_proposals: torch.Tensor):
+    """Apply regression transformations in anchors to get proposal boxes or in proposals to get final box predictions 
+
+    Args:
+        box_trasnform_pred (torch.Tensor): (num_anchors_or_proposals, num_classes, 4)
+        anchors_or_proposals (torch.Tensor): (num_anchors_or_proposals, 4)
+        return: pred_boxes (num_anchors_or_proposals, num_classes, 4)
+    """
+    box_trasnform_pred = box_trasnform_pred.reshape(
+        box_trasnform_pred.size(0), -1, 4
+    )
+    
+
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512):
         """
@@ -45,6 +58,7 @@ class RegionProposalNetwork(nn.Module):
         Args:
             image (Tensor): original image (eg: 1x3x600x800)
             feat (Tensor): feature map (eg: 1x512x37x50)
+            return:  Anchors boxes in the feature map
         """
         grid_h, grid_w = feature_map.shape[-2:] # feature map height and width
         image_h, image_w = image.shape[-2:] # image height and width
@@ -122,3 +136,26 @@ class RegionProposalNetwork(nn.Module):
         
         #Generate anchors
         anchors = self.generate_anchors(image, feature_map)
+        
+        # reshaping classification_scores to be the same shape as anchors
+        # classification_scores -> (batch, Numer of anchors per location, h_feat, w_feat)
+        number_of_anchors_per_location = classification_scores.size(1)
+        classification_scores = classification_scores.permute(0,2,3,1) # classification_scores -> (batch, h_feat, w_feat, Numer of anchors per location)
+        classification_scores.reshape(-1, 1) # classification_scores -> (batch * h_feat * w_feat * Numer of anchors per location, 1)
+        
+        # reshaping box_transformation_preds scores to be the same shape as anchors
+        # box_transformation_preds -> (Batch, Number of Anchors per location * 4, h_feat, w_feat)
+        
+        box_transformation_preds = box_transformation_preds.view(
+            box_transformation_preds.size(0), #Batch
+            number_of_anchors_per_location, # Number of Anchors per location
+            4, # 4 predicted bbox_coordinates(p_tx, p_ty, p_tz, p_tw)
+            rpn_feat_representation_map.shape[-2], # h_feat
+            rpn_feat_representation_map.shape[-1] # w_feat
+        ) # box_transformation_preds -> (Batch, Number of Anchors per location, 4, h_feat, w_feat)
+        
+        box_transformation_preds = box_transformation_preds.permute(0, 3, 4, 1, 2)
+        box_transformation_preds = box_transformation_preds.reshape(-1, 4) # box_transformation_preds -> (Batch * Number of Anchors per location * h_feat * w_feat, 4)
+        
+
+        
