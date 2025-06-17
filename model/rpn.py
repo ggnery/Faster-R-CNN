@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision
+from typing import Tuple
 import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -17,6 +18,112 @@ def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tens
         box_trasnform_pred.size(0), -1, 4
     )
     
+    #get xs, cy, w, h from x1, y1, x2, y2 of anchors/proposals
+    w = anchors_or_proposals[:, 2] - anchors_or_proposals[:, 0] # x2 - x1
+    h = anchors_or_proposals[:, 3] - anchors_or_proposals[:, 1] # y2 - y1
+    center_x = anchors_or_proposals[:, 0] + 0.5 * w # x1 + w/2
+    center_y = anchors_or_proposals[:, 1] + 0.5 * h # y1 + h/2
+    
+    #Transformation predictions (tx, ty, tw, th)
+    # all bellow have dimension (num_anchors_or_proposals, num_classes, 1) 
+    tx = box_trasnform_pred[..., 0]  
+    ty = box_trasnform_pred[..., 1]
+    tw = box_trasnform_pred[..., 2]
+    th = box_trasnform_pred[..., 3]
+    
+    # Applying trasnformations
+    # P -> Anchor box
+    # G -> Ground truth
+    pred_center_x = tx * w[:, None] + center_x[:, None] # Gx = tx * Pw + Px
+    pred_center_y = ty * h[:, None] + center_y[:, None] # Gy = ty * Ph + Py
+    pred_w = torch.exp(tw) * w[:, None] # Gw = exp(tw) * Pw
+    pred_h = torch.exp(th) * h[:, None] # Gh = exp(th) * Ph
+    
+    # Calculating regressed box coordinates
+    # all bellow have dimension -> (num_anchors_or_proposals, num_classes, 1)
+    pred_box_x1 = pred_center_x - 0.5 * pred_w
+    pred_box_y1 = pred_center_y - 0.5 * pred_h
+    pred_box_x2 = pred_center_x + 0.5 * pred_w
+    pred_box_y2 = pred_center_y + 0.5 * pred_h
+    
+    # get predicted boxes
+    # pred_boxes -> (num_anchors_or_proposals, num_classes, 4) 
+    pred_boxes = torch.stack((pred_box_x1,
+                              pred_box_y1,
+                              pred_box_x2,
+                              pred_box_y2), dim = 2)
+    
+    return pred_boxes
+    
+
+def clamp_boxes_to_image_boundary(boxes: torch.Tensor, image_shape) -> torch.Tensor:
+    """filter boxes only inside image boundary 
+
+    Args:
+        boxes (torch.Tensor): proposal boxes
+        image_shape (_type_): original image shape
+
+    Returns:
+        torch.Tensor: boxes within image
+    """
+    boxes_x1 = boxes[..., 0]
+    boxes_y1 = boxes[..., 1]
+    boxes_x2 = boxes[..., 2]
+    boxes_y2 = boxes[..., 3]
+    height, width = image_shape[-2:]
+    
+    boxes_x1 = boxes_x1.clamp(min=0, max=width)
+    boxes_x2 = boxes_x2.clamp(min=0, max=width)
+    boxes_y1 = boxes_y1.clamp(min=0, max=height)
+    boxes_y2 = boxes_y2.clamp(min=0, max=height)
+    
+    boxes = torch.cat((
+        boxes_x1[..., None],
+        boxes_y1[..., None],
+        boxes_x2[..., None],
+        boxes_y2[..., None]
+    ), dim=-1)
+    
+    return boxes
+
+def filter_proposals(proposals: torch.Tensor, classification_scores: torch.Tensor, image_shape) -> Tuple[torch.Tensor, torch.Tensor]:
+    """filter proposals based on following criterias
+    1- top 10000 classification scores
+    2- boxes inside image boundaries
+    3- NMS with 0.7 threshold on objectness (with top 2000 classification scores)
+
+    Args:
+        proposals (torch.Tensor): proposals 
+        classification_scores (torch.Tensor): classification scores for porposal
+        image_shape (_type_): original image shape
+
+    Returns:
+        torch.Tensor: filtered proposals
+    """
+    #Pre NMS filtering
+    classification_scores = classification_scores.reshape(-1) # flatten proposal classification scores
+    classification_scores = torch.sigmoid(classification_scores)
+    _, top_n_idx = classification_scores.topk(10000) # get top 10000 proposal based on classification scores (foreground or background)
+    classification_scores = classification_scores[top_n_idx]
+    proposals = proposals[top_n_idx] # filter only top 10000 proposals
+    
+    # Clamp boxes to image boundary
+    proposals = clamp_boxes_to_image_boundary(proposals, image_shape)
+    
+    #NMS based on objectness
+    keep_mask = torch.zeros_like(classification_scores, dtype=torch.bool) # mask with proposals to keep
+    keep_indices = torchvision.ops.nms(proposals, classification_scores, 0.7) # apply nms with 0.7 threshold
+    
+    #sort keep_indices by classification scores
+    post_nms_keep_indices = keep_indices[
+        classification_scores[keep_indices].sort(descending=True)[1]
+    ]
+    
+    # Post NMS topk = 2000 filtering
+    proposals = proposals[post_nms_keep_indices[:2000]]
+    classification_scores = classification_scores[post_nms_keep_indices[:2000]]
+    
+    return proposals, classification_scores
 
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512):
@@ -145,7 +252,6 @@ class RegionProposalNetwork(nn.Module):
         
         # reshaping box_transformation_preds scores to be the same shape as anchors
         # box_transformation_preds -> (Batch, Number of Anchors per location * 4, h_feat, w_feat)
-        
         box_transformation_preds = box_transformation_preds.view(
             box_transformation_preds.size(0), #Batch
             number_of_anchors_per_location, # Number of Anchors per location
@@ -157,5 +263,18 @@ class RegionProposalNetwork(nn.Module):
         box_transformation_preds = box_transformation_preds.permute(0, 3, 4, 1, 2)
         box_transformation_preds = box_transformation_preds.reshape(-1, 4) # box_transformation_preds -> (Batch * Number of Anchors per location * h_feat * w_feat, 4)
         
+        # Transforming generated anchors according to box_transform_pred
+        proposals = apply_regression_pred_to_anchors_or_proposals(
+            box_transformation_preds.detach().reshape(-1, 1, 4) # (Batch * Number of Anchors per location * h_feat * w_feat, 1, 4) where the 1 here is class (background or foregroung)
+        )
+        
+        #Filtering the proposals
+        proposals = proposals.reshape(proposals.size(0), 4) # (Batch * Number of Anchors per location * h_feat * w_feat, 4)
+        proposals, scores = filter_proposals(proposals, classification_scores, image.shape)
 
+        rpn_output = {
+            "proposals": proposals,
+            "scores": scores
+        }
+        
         
