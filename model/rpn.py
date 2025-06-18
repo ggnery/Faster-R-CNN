@@ -6,7 +6,7 @@ import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tensor, anchors_or_proposals: torch.Tensor):
+def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tensor, anchors_or_proposals: torch.Tensor) -> torch.Tensor:
     """Apply regression transformations in anchors to get proposal boxes or in proposals to get final box predictions 
 
     Args:
@@ -125,6 +125,36 @@ def filter_proposals(proposals: torch.Tensor, classification_scores: torch.Tenso
     
     return proposals, classification_scores
 
+def get_iou(boxes1 :torch.Tensor, boxes2 :torch.Tensor) -> torch.Tensor:
+    """from boxes1 (Nx4) and boxes2 (Mx4) compute IoU matrix between then (NxM)
+
+    Args:
+        boxes1 (torch.Tensor): (Nx4)
+        boxes2 (torch.Tensor): (Mx4)
+
+    Returns:
+        torch.Tensor: IoU matrix of shape (NxM) of all boxes combinations
+    """
+    #Compute area of boxes (x2 - x1) * (y2 - y1)
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    
+    #Get top left x1, y1 in each possible box pair intersection
+    x_left = torch.max(boxes1[:, None, 0], boxes2[:, None, 0]) # Get top left x (NxM)
+    y_top = torch.max(boxes1[:, None, 1], boxes2[:, None, 1]) # Get top left y (NxM)
+    
+    #Get bottom right x2, y2 in each possible box pair intersection
+    x_right = torch.min(boxes1[:, None, 2], boxes2[:, None, 2]) # Get bottom right x (NxM)
+    y_bottom = torch.min(boxes1[:, None, 3], boxes2[:, None, 3]) # Get bottom right y (NxM)
+    
+    # Since intersection area cannot be negative, clamp(min=0) ensures that:
+    # If boxes don't overlap → width/height becomes 0 → intersection area = 0
+    # If boxes do overlap → positive width/height → correct intersection area
+    intersection_area = (x_right - x_left).clamp(min=0) * (y_bottom - y_top).clamp(min=0)
+    union = area1[:,None] + area2 - intersection_area
+    
+    return intersection_area/union #(NxM)
+    
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512):
         """
@@ -228,6 +258,127 @@ class RegionProposalNetwork(nn.Module):
         
         #Note: In this implementation, the center of anchors is not in the middle of the cell, instead they are in top left corner of each cell
         return anchors
+    
+    def assign_targets_to_anchors(self, anchors: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
+        """Assigns ground truth boxes to anchor boxes for training object detectors.
+    
+        This function implements the anchor assignment strategy commonly used in object
+        detection frameworks (e.g., Faster R-CNN). It matches each anchor box with the
+        most suitable ground truth box based on IoU overlap, following these rules:
+        
+        1. High-quality matches (IoU >= 0.7): Assigned as positive/foreground
+        2. Low-quality matches (IoU < 0.3): Assigned as negative/background  
+        3. Medium-quality matches (0.3 <= IoU < 0.7): Ignored during training
+        4. Special case: For each ground truth box, ensures at least one anchor is 
+        assigned to it (even if IoU < 0.7) to guarantee all objects are detected
+        
+        Args:
+            anchors (torch.Tensor): Anchor boxes for the image. Shape: (N, 4) where N is
+                the number of anchors (e.g., 16650) and each row contains [x1, y1, x2, y2].
+            gt_boxes (torch.Tensor): Ground truth bounding boxes. Shape: (M, 4) where M
+                is the number of objects (e.g., 6) and each row contains [x1, y1, x2, y2].
+        
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+                - labels (torch.Tensor): Shape (N,). Classification labels for each anchor:
+                    * 1.0: Foreground/positive (has object)
+                    * 0.0: Background/negative (no object)
+                    * -1.0: Ignored (ambiguous, excluded from loss)
+                - matched_gt_boxes (torch.Tensor): Shape (N, 4). Ground truth box 
+                    coordinates assigned to each anchor. For background/ignored anchors,
+                    these are placeholder values (copies of gt_box[0]) that won't be
+                    used during training.
+        
+        Example:
+            >>> anchors = torch.tensor([[10, 10, 20, 20], [30, 30, 40, 40], ...])  # Shape: (16650, 4)
+            >>> gt_boxes = torch.tensor([[15, 15, 25, 25], [35, 35, 45, 45], ...])  # Shape: (6, 4)
+            >>> labels, matched_boxes = assign_targets_to_anchors(anchors, gt_boxes)
+            >>> # labels[i] = 1.0 if anchor[i] matches an object (IoU >= 0.7)
+            >>> # labels[i] = 0.0 if anchor[i] is background (IoU < 0.3)
+            >>> # labels[i] = -1.0 if anchor[i] is ignored (0.3 <= IoU < 0.7)
+        """
+        
+        # get IoU matrix with shape (gt_boxes, num_anchors)
+        iou_matrix = get_iou(gt_boxes, iou_matrix) # eg -> 6 x 16650
+        
+        # For each anchor get best ground truth box index
+        # Goes column by column (each column is one anchor)
+        # Finds the maximum IoU value in that column
+        # Records which row (gt_box) had that maximum
+        # The matrix looks like:
+        #          anchor0  anchor1  anchor2 ... anchor16649
+        # gt_box0   0.1      0.3      0.05         0.2
+        # gt_box1   0.7      0.2      0.15         0.1
+        # gt_box2   0.2      0.8      0.03         0.4
+        # gt_box3   0.05     0.1      0.9          0.3
+        # gt_box4   0.15     0.05     0.2          0.6
+        # gt_box5   0.3      0.15     0.1          0.15
+        
+        # best_match_iou: Tensor of shape (16650,) containing the highest IoU for each anchor
+        # Example: [0.7, 0.8, 0.9, ..., 0.6]
+
+        # best_match_gt_index: Tensor of shape (16650,) containing the index of the best matching gt_box
+        # Example: [1, 2, 3, ..., 4]
+        best_match_iou, best_match_gt_index = iou_matrix.max(dim=0)
+        
+        #This copy will be needed later to add low quality boxes 
+        best_match_gt_idx_pre_threshold = best_match_gt_index.clone()
+        
+        bellow_low_threshold = best_match_iou < 0.3 # background anchors
+        between_threshold = (best_match_iou >= 0.3) & (best_match_iou < 0.7) # ignored anchors
+        
+        best_match_gt_index[bellow_low_threshold] = -1 # -1 is backfround
+        best_match_gt_index[between_threshold] = -2 # -2 is ignored
+        
+        # *LOW QUALITY POSITIVE anchor boxes process
+        # Those low quality positive anchors are between 0.3 and 0.7 but have high threashold 
+        #
+        # for each gt box we are finding the maximum IoU value in which this gt box has with any anchor
+        best_anchor_iou_for_gt, _ = iou_matrix.max(dim=1) # Get the best anchor for each gt_box -> (6,)
+        
+        # Get all the anchor boxes which have the same overlap value with ground truth i'th box
+        # In a nutshell, we are getting ground truth box and anchor box pairs that have maximum IoU between them
+        gt_pred_pair_with_highest_iou = torch.where(iou_matrix == best_anchor_iou_for_gt[:, None]) 
+        
+        # Get all box indexes which are low quality positive anchor canditades 
+        # and update the ground truth box indexes of those
+        pred_inds_to_update = gt_pred_pair_with_highest_iou[1]
+        best_match_gt_index[pred_inds_to_update] = best_match_gt_idx_pre_threshold[pred_inds_to_update] # keep low quality positive anchors in best_match_gt_index
+        
+        # *Seting regression targets for the anchors 
+        # due to clamp, all -1 or -2 anchors will be assigned as background (background is treated as 0'th anchor)
+        # Example
+        # If gt_boxes is:
+        # [[10, 20, 30, 40],   # gt_box 0
+        #  [50, 60, 70, 80],   # gt_box 1
+        #  [90, 100, 110, 120], # gt_box 2
+        #  ...]
+
+        # And best_match_gt_index (after clamp) is [1, 0, 2, 0, 1, ...]
+
+        # Then matched_gt_boxes will be:
+        # [[50, 60, 70, 80],    # anchor 0 -> gt_box 1
+        #  [10, 20, 30, 40],    # anchor 1 -> gt_box 0
+        #  [90, 100, 110, 120], # anchor 2 -> gt_box 2
+        #  [10, 20, 30, 40],    # anchor 3 -> gt_box 0 (was background)
+        #  [50, 60, 70, 80],    # anchor 4 -> gt_box 1
+        #  ...]                 # ... for all 16650 anchors
+        matched_gt_boxes = gt_boxes[best_match_gt_index.clamp(min=0)] #  size 16650x4
+        
+        # set all foreground anchor labels as 1
+        labels = best_match_gt_index >= 0
+        labels = labels.to(dtype=torch.float32)
+        
+        # set all background labels as 0
+        background_anchors = best_match_gt_index == -1
+        labels[background_anchors] = 0.0
+        
+        # Set all ignored anchors labels as -1
+        ignored_anchors = best_match_gt_index == -2
+        labels[ignored_anchors] = -1.0
+        
+        # Later for classification we pick labels which are >= 0
+        return labels, matched_gt_boxes 
         
     def forward(self, image, feature_map, target):
         """Forward method for RPN
@@ -273,8 +424,16 @@ class RegionProposalNetwork(nn.Module):
         proposals, scores = filter_proposals(proposals, classification_scores, image.shape)
 
         rpn_output = {
-            "proposals": proposals,
-            "scores": scores
+            "proposals": proposals, # eg: proposals -> (2000 x 4)
+            "scores": scores # eg: scores -> (2000 x 4)
         }
         
         
+        if not self.train or target is None:
+            return rpn_output
+        else:
+        # In train mode, assign ground truth values to anchors and compute
+            labels_for_anchors, matched_gt_boxes_for_anchors = self.assign_targets_to_anchors(
+                anchors,
+                target["bboxes"][0]
+            ) 
