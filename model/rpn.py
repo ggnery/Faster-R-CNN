@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torchvision
 from typing import Tuple
-import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -304,7 +303,198 @@ def get_iou(boxes1 :torch.Tensor, boxes2 :torch.Tensor) -> torch.Tensor:
     union = area1[:,None] + area2 - intersection_area
     
     return intersection_area/union #(NxM)
+  
+def boxes_to_transformation_targets(ground_truth_boxes: torch.Tensor, anchors_or_proposals: torch.Tensor) -> torch.Tensor:  
+    """Converts ground truth boxes and reference boxes into regression targets for training.
     
+    This function implements the inverse transformation of `apply_regression_pred_to_anchors_or_proposals`.
+    It computes the regression targets (tx, ty, tw, th) that the network should learn to predict
+    in order to transform anchor/proposal boxes into ground truth boxes. This parameterization
+    is crucial for stable training and good performance in object detection models.
+    
+    The transformation targets are computed as:
+    - tx = (Gx - Px) / Pw  (normalized x-center offset)
+    - ty = (Gy - Py) / Ph  (normalized y-center offset)  
+    - tw = log(Gw / Pw)    (log-space width ratio)
+    - th = log(Gh / Ph)    (log-space height ratio)
+    
+    Where:
+    - P = (Px, Py, Pw, Ph): anchor/proposal center and size
+    - G = (Gx, Gy, Gw, Gh): ground truth center and size
+    
+    Args:
+        ground_truth_boxes (torch.Tensor): Target boxes to regress to. Shape: (N, 4)
+            where each row contains [x1, y1, x2, y2] in corner format.
+            In RPN training, these are the matched GT boxes for each anchor.
+            
+        anchors_or_proposals (torch.Tensor): Reference boxes to transform from. Shape: (N, 4)
+            where each row contains [x1, y1, x2, y2] in corner format.
+            Must have the same number of boxes as ground_truth_boxes.
+    
+    Returns:
+        torch.Tensor: Regression targets for training. Shape: (N, 4)
+            Each row contains [tx, ty, tw, th] representing the transformations
+            needed to convert the corresponding anchor/proposal to its ground truth.
+    
+    Mathematical Intuition:
+        1. **Center offsets (tx, ty)**: Normalized by anchor size to make the targets
+           scale-invariant. A tx=0.5 means "shift right by half the anchor width"
+           regardless of the anchor's absolute size.
+           
+        2. **Size ratios (tw, th)**: Using log-space prevents negative sizes and makes
+           multiplicative changes additive. tw=0 means "keep same size", tw=log(2)≈0.69
+           means "double the size", tw=log(0.5)≈-0.69 means "halve the size".
+    
+    Example:
+        >>> # Single anchor-GT pair example
+        >>> anchor = torch.tensor([[100, 100, 200, 200]])  # 100x100 box centered at (150, 150)
+        >>> gt_box = torch.tensor([[110, 110, 230, 230]])  # 120x120 box centered at (170, 170)
+        >>> targets = boxes_to_transformation_targets(gt_box, anchor)
+        >>> # targets ≈ [[0.2, 0.2, 0.182, 0.182]]
+        >>> # Interpretation:
+        >>> # - tx=0.2: shift center right by 20% of anchor width (0.2 * 100 = 20 pixels)
+        >>> # - ty=0.2: shift center down by 20% of anchor height  
+        >>> # - tw≈0.182: increase width by factor of exp(0.182)≈1.2 (from 100 to 120)
+        >>> # - th≈0.182: increase height by factor of exp(0.182)≈1.2
+        
+        >>> # Batch example for RPN training
+        >>> anchors = generate_anchors(image, feature_map)  # (16650, 4)
+        >>> labels, matched_gt = assign_targets_to_anchors(anchors, gt_boxes)
+        >>> regression_targets = boxes_to_transformation_targets(matched_gt, anchors)
+        >>> # regression_targets.shape = (16650, 4)
+        >>> # Only targets for positive anchors (labels==1) will be used in loss
+    
+    Training Benefits:
+        1. **Normalized targets**: tx, ty typically in range [-1, 1] for well-matched pairs
+        2. **Bounded values**: tw, th typically in range [-1, 1] for reasonable size changes
+        3. **Symmetric**: Doubling and halving have same magnitude (opposite sign)
+        4. **Smooth gradients**: No discontinuities or extreme values
+    
+    Note:
+        - The function assumes valid boxes (x2 > x1, y2 > y1)
+        - No clipping is applied to the targets - extreme values may occur for
+          poorly matched anchor-GT pairs
+        - During training, only positive anchors' targets are used in the loss
+    """
+    #get center x, center y, w, h from anchors (x1, y1, x2, y2) coordinates
+    widths = anchors_or_proposals[:, 2] - anchors_or_proposals[:, 0]
+    heights = anchors_or_proposals[:, 3] - anchors_or_proposals[:, 1]
+    center_x = anchors_or_proposals[:, 0] + 0.5 * widths
+    center_y = anchors_or_proposals[:, 1] + 0.5 * heights
+    
+    #get center x, center y, w, h from gt boxes (x1, y1, x2, y2) coordinates
+    gt_widths = ground_truth_boxes[:, 2] - ground_truth_boxes[:, 0]
+    gt_heights = ground_truth_boxes[:, 3] - ground_truth_boxes[:, 1]
+    gt_center_x = ground_truth_boxes[:, 0] + 0.5 * gt_widths
+    gt_center_y = ground_truth_boxes[:, 1] + 0.5 * gt_heights
+    
+    target_tx = (gt_center_x - center_x) / widths # tx = (Gx - Px) / Pw
+    target_ty = (gt_center_y - center_y) / heights # ty = (Gy - Py) / Ph
+    target_tw = torch.log(gt_widths / widths) # tw = log(Gw/Pw)
+    target_dh = torch.log(gt_heights / heights) # th = log(Gh/Ph)
+    
+    regression_targets = torch.stack((
+        target_tx,
+        target_ty,
+        target_tw,
+        target_dh
+    ), dim=1)
+    return regression_targets
+    
+def sample_positive_negative(labels: torch.Tensor, positive_count: int, total_count: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Samples a balanced subset of positive and negative anchors for training.
+    
+    This function implements the sampling strategy used in Faster R-CNN to address the
+    extreme class imbalance in object detection. Since most anchors are background
+    (negative), training on all anchors would bias the model. Instead, we sample a
+    small, balanced subset for each training batch.
+    
+    The sampling follows these rules:
+    1. Sample up to `positive_count` positive anchors (foreground)
+    2. Sample remaining slots with negative anchors (background)  
+    3. If fewer positive anchors exist than `positive_count`, sample more negatives
+    4. Random sampling ensures different anchors are seen across iterations
+    
+    Args:
+        labels (torch.Tensor): Classification labels for all anchors. Shape: (N,)
+            where N is the total number of anchors (e.g., 16650). Values:
+            - 1.0: Positive/foreground anchor (matched to object)
+            - 0.0: Negative/background anchor (no object)
+            - -1.0: Ignored anchor (not used in training)
+            
+        positive_count (int): Maximum number of positive anchors to sample.
+            Typically 128 in Faster R-CNN (50% of mini-batch).
+            
+        total_count (int): Total number of anchors to sample (positive + negative).
+            Typically 256 in Faster R-CNN (mini-batch size).
+    
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: Two boolean masks with shape (N,):
+            - sampled_neg_idx_mask: True for sampled negative anchors
+            - sampled_pos_idx_mask: True for sampled positive anchors
+            
+    Sampling Strategy:
+        1. **Identify candidates**: Find all positive (label >= 1) and negative (label == 0) anchors
+        2. **Sample positives**: Randomly select min(num_positive_available, positive_count)
+        3. **Fill with negatives**: Use remaining budget for negative samples
+        4. **Random selection**: Use random permutation for unbiased sampling
+    
+    Example:
+        >>> # Typical RPN scenario with class imbalance
+        >>> labels = torch.tensor([1., 0., 0., -1., 0., 1., 0., 0., -1., 0., ...])
+        >>> # Assume: 150 positive, 16000 negative, 500 ignored out of 16650 total
+        >>> neg_mask, pos_mask = sample_positive_negative(labels, 128, 256)
+        >>> 
+        >>> # Expected behavior:
+        >>> pos_mask.sum()  # 128 (all available positives selected)
+        >>> neg_mask.sum()  # 128 (256 - 128 = 128 negatives)
+        >>> 
+        >>> # Edge case: Few positives available
+        >>> labels_few_pos = torch.zeros(16650)  # All negative
+        >>> labels_few_pos[:50] = 1.0  # Only 50 positives
+        >>> neg_mask, pos_mask = sample_positive_negative(labels_few_pos, 128, 256)
+        >>> pos_mask.sum()  # 50 (all available)
+        >>> neg_mask.sum()  # 206 (256 - 50 = 206 negatives)
+    
+    Implementation Details:
+        - Uses torch.randperm for efficient random sampling without replacement
+        - Returns boolean masks instead of indices for easier indexing
+        - Handles edge cases gracefully (e.g., insufficient anchors)
+        - Ignored anchors (label == -1) are never sampled
+    
+    Why Balanced Sampling?
+        1. **Class imbalance**: ~98% of anchors are typically background
+        2. **Gradient stability**: Prevents background loss from dominating
+        3. **Faster convergence**: Focus on informative examples
+        4. **Better performance**: Improves detection accuracy
+    """
+    positive = torch.where(labels >= 1)[0] # foreground anchors
+    negative = torch.where(labels == 0)[0] # background anchors
+    
+    # First sample as many positive as we can
+    # if the count of positives can't be reached, sample extra negative anchors
+    num_pos = min(positive.numel(), positive_count) 
+    num_neg = total_count - num_pos
+    num_neg = min(negative.numel(), num_neg)
+    
+    #Select randomly the desired number of positive and negative anchor indexes
+    permuted_positive_idx = torch.randperm(positive.numel(), device=positive.device)[:num_pos]
+    permuted_negative_idx = torch.randperm(negative.numel(), device=negative.device)[:num_neg]
+    
+    pos_idxs = positive[permuted_positive_idx]
+    neg_idxs = negative[permuted_negative_idx]
+    
+    #Returns 2 boolean masks with same shape as labels
+    # 1 - indexes that belong to negative anchors are true
+    # 2 - indexes that belong to positive anchors are true
+    sampled_neg_idx_mask = torch.zeros_like(labels, dtype=torch.bool, device=labels.device)
+    sampled_pos_idx_mask = torch.zeros_like(labels, dtype=torch.bool, device=labels.device)
+    
+    sampled_neg_idx_mask[neg_idxs] = True
+    sampled_pos_idx_mask[pos_idxs] = True
+    
+    return sampled_neg_idx_mask, sampled_pos_idx_mask
+
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512):
         """Initializes the Region Proposal Network (RPN) module for object detection.
@@ -738,12 +928,88 @@ class RegionProposalNetwork(nn.Module):
         return proposals, classification_scores
         
     def forward(self, image, feature_map, target):
-        """Forward method for RPN
+        """Executes the Region Proposal Network forward pass for object proposal generation.
+    
+        This method implements the complete RPN pipeline, which serves as the first stage
+        in two-stage object detectors like Faster R-CNN. It processes feature maps to
+        generate object proposals that are later refined by the second stage (RCNN).
+        
+        Inference
+            - Call RPN layers
+            - Generate anchors
+            - Convert anchors to proposals using box transformation prediction
+            - Filter proposals
+        Training only
+            - All steps done in inference
+            - Assign ground truth boxes to anchors
+            - Compute labels and regression targets for anchors
+            - Sample positive and negative anchors
+            - Compute classification loss using sampled anchors
+            - Compute localization loss using sampled positive anchors
+
+        Detailed Algorithm Flow:
+    
+        1. **Feature Extraction** (3×3 conv + ReLU):
+            
+        2. **Parallel Predictions** (1×1 convs):
+
+            
+        3. **Anchor Generation**:
+            - Creates K anchors at each of H_feat × W_feat locations
+            - Total anchors = H_feat × W_feat × K (e.g., 37×50×9 = 16,650)
+            - Anchors have 3 scales × 3 aspect ratios = 9 variants per location
+            
+        4. **Proposal Generation**:
+            - Applies predicted deltas to anchors: proposals = transform(anchors, deltas)
+            - No gradient flow through proposals during training (uses .detach())
+            
+        5. **Proposal Filtering** (inference and training):
+            - Top-K by score (K=10,000) → Boundary clipping → NMS (IoU=0.7) → Top-K (K=2,000)
+            - Typically reduces from ~16,650 raw proposals to ≤2,000 high-quality ones
+            
+        6. **Loss Computation** (training only):
+            - Assigns ground truth to anchors based on IoU overlap
+            - Samples 256 anchors (128 positive, 128 negative) for efficiency
+            - Classification loss: BCE on all sampled anchors
+            - Localization loss: Smooth L1 on positive anchors only
 
         Args:
-            image (Tensor): original image (eg: 1x3x600x800)
-            feature_map (Tensor): feature map (eg: 1x512x37x50)
-            target (Dict[str, Tensor]): Dict with "bboxes" and "labels" keys (eg: target["bboxes"] - 1x6x4  target["labels"]- 1x6)
+            image (torch.Tensor): Original input image tensor. Shape: (B, C, H, W)
+                - B: Batch size (typically 1 for object detection)
+                - C: Number of channels (typically 3 for RGB)
+                - H, W: Image height and width (e.g., 600, 800)
+                Used only for computing anchor positions relative to feature map stride.
+                
+            feature_map (torch.Tensor): CNN feature map from backbone network.
+                Shape: (B, C_feat, H_feat, W_feat)
+                - B: Batch size (must match image batch size)
+                - C_feat: Feature channels (e.g., 512 for VGG, 256/512/1024/2048 for ResNet)
+                - H_feat, W_feat: Spatial dimensions (e.g., 37×50 for 600×800 image with stride 16)
+                This is the main input that RPN processes to generate proposals.
+                
+            target (Dict[str, torch.Tensor], optional): Ground truth annotations for training.
+                Required keys:
+                - "bboxes": Ground truth boxes. Shape: (B, N_gt, 4) where N_gt is the number
+                of objects. Each box is [x1, y1, x2, y2] in image coordinates.
+                - "labels": Object class labels. Shape: (B, N_gt). Not used by RPN but
+                required for consistency with the full model interface.
+                If None, the network runs in inference mode (no loss computation).        
+        
+        Returns:
+            Dict[str, torch.Tensor]: Output dictionary containing:
+                
+            **Always included (inference and training)**:
+                - "proposals": Filtered region proposals. Shape: (N_proposals, 4)
+                where N_proposals ≤ 2000. Each row is [x1, y1, x2, y2] in image coords.
+                Sorted by objectness score in descending order.
+                - "scores": Objectness scores for proposals. Shape: (N_proposals,)
+                Values in range [0, 1] after sigmoid. Higher = more likely to contain object.
+                
+            **Training mode only** (when target is provided):
+                - "rpn_classification_loss": Binary cross-entropy loss for objectness.
+                Scalar value averaged over sampled anchors (256 per image).
+                - "rpn_localization_loss": Smooth L1 loss for bounding box regression.
+                Scalar value averaged over positive anchors only (~128 per image).
         """
         rpn_feat_representation_map = nn.ReLU()(self.rpn_conv(feature_map)) # Apply ReLu activation function in the 3x3 conv opertation 
         classification_scores = self.classification_layer(rpn_feat_representation_map) # Apply 1x1 conv in feature representation map to get anchor scores (eg: 1x9x37x50)
@@ -784,13 +1050,41 @@ class RegionProposalNetwork(nn.Module):
             "proposals": proposals, # eg: proposals -> (2000 x 4)
             "scores": scores # eg: scores -> (2000 x 4)
         }
-        
-        
+            
         if not self.train or target is None:
             return rpn_output
         else:
-        # In train mode, assign ground truth values to anchors and compute
+            # In train mode, assign ground truth values to anchors
+            # matched_gt_boxes_for_anchors -> (Number of anchors in image, 4)
             labels_for_anchors, matched_gt_boxes_for_anchors = self.assign_targets_to_anchors(
                 anchors,
                 target["bboxes"][0]
             ) 
+            
+            # Based on gt assignment above, get groud truth regression targets (tx, ty, tz, tw) for anchors
+            regression_targets = boxes_to_transformation_targets(matched_gt_boxes_for_anchors, anchors) # 16650x4
+            
+            # Sample positive (foreground) and negative anchors (background) for training
+            sampled_neg_idx_mask, sampled_pos_idx_mask = sample_positive_negative(labels_for_anchors, positive_count=128, total_count=256)
+            sampled_idxs = torch.where(sampled_pos_idx_mask | sampled_neg_idx_mask)[0] #get positive and negative anchor idxs
+            
+            #Smooth L1 loss for proposal regression (positive only)
+            localization_loss = (
+                torch.nn.functional.smooth_l1_loss(
+                    box_transformation_preds[sampled_pos_idx_mask], # box_transformation_preds -> predicted (tx, ty, tz, tw) from 1x1 conv layer
+                    regression_targets[sampled_pos_idx_mask], # regression_targets -> gt regression targets (tx, ty, tz, tw) for each anchor
+                    beta=1/9,
+                    reduction='sum'
+                ) / (sampled_idxs.numel())
+            )
+            
+            # Binary cross entropy loss between classification scores and labels of sampled indexes (positive and negative)
+            classificatio_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+                classification_scores[sampled_idxs].flatten(), # classification_scores -> predicted classification scores for anchors after 1x1 conv layer
+                labels_for_anchors[sampled_idxs].flatten() # labels_for_anchors -> ground truth classification scores for anchors
+            )
+            
+            rpn_output["rpn_classification_loss"] = classificatio_loss
+            rpn_output["rpn_localization_loss"] = localization_loss
+            
+            return rpn_output
