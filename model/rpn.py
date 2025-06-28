@@ -525,7 +525,6 @@ class RegionProposalNetwork(nn.Module):
             aspect_ratios (list): Height/width ratios [0.5, 1, 2] corresponding to
                 rectangular anchors (1:2, 1:1, 2:1).
             num_anchors (int): Number of anchors per location (should be 9).
-                NOTE: There's a bug here - should use len(scales) * len(aspect_ratios)
             rpn_conv (Conv2d): 3×3 conv layer that processes the feature map to
                 extract spatial features for proposal generation.
             classification_layer (Conv2d): 1×1 conv that outputs K objectness scores
@@ -558,7 +557,7 @@ class RegionProposalNetwork(nn.Module):
         self.scales = [128, 256, 512] # scales/areas for anchor boxes in feature map (128^2, 256^2 and 512^2)
         self.aspect_ratios = [0.5, 1, 2] # aspect_ratios for anchor boxes in feature map (1:2, 1:1, 2:1)
         
-        self.num_anchors = len(self.scales, self.aspect_ratios) #Each feature map cell will have 3x3 = 9 anchor boxes  
+        self.num_anchors = len(self.scales) * len(self.aspect_ratios) #Each feature map cell will have 3x3 = 9 anchor boxes  
         
         # 3x3 conv to get feature representation map
         self.rpn_conv = nn.Conv2d(in_channels=in_channels, 
@@ -760,7 +759,7 @@ class RegionProposalNetwork(nn.Module):
         bellow_low_threshold = best_match_iou < 0.3 # background anchors
         between_threshold = (best_match_iou >= 0.3) & (best_match_iou < 0.7) # ignored anchors
         
-        best_match_gt_index[bellow_low_threshold] = -1 # -1 is backfround
+        best_match_gt_index[bellow_low_threshold] = -1 # -1 is background
         best_match_gt_index[between_threshold] = -2 # -2 is ignored
         
         # *LOW QUALITY POSITIVE anchor boxes process
