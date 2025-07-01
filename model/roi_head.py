@@ -3,7 +3,7 @@ import torchvision
 
 from torch import nn
 from typing import Tuple
-from .rpn import get_iou, sample_positive_negative, boxes_to_transformation_targets
+from .rpn import get_iou, sample_positive_negative, boxes_to_transformation_targets, apply_regression_pred_to_anchors_or_proposals, clamp_boxes_to_image_boundary
 
 class ROIHead(nn.Module):
     def __init__(self, num_classes = 21, in_channels = 512):
@@ -101,20 +101,120 @@ class ROIHead(nn.Module):
         labels[background_proposal] = 0
         
         return labels, matched_gt_boxes_for_proposals # both have shape (2000,) and (2000, 4)
-        
-    def forward(self, feature_map: torch.Tensor, proposals: torch.Tensor, image_shape: Tuple, target):
-        """
+    
+    def filter_predictions(self, pred_boxes: torch.Tensor, pred_scores: torch.Tensor, pred_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:    
+        """Refines raw predictions by applying a series of filtering steps.
+
+        This function processes the output of the detection head to produce a clean,
+        final set of bounding boxes. It filters out low-confidence and small boxes,
+        removes redundant overlapping boxes using class-wise Non-Maximum Suppression (NMS),
+        and returns only the top-scoring predictions.
+
+        Algorithm:
+        1.  **Score Thresholding:** Removes all predictions with a confidence score
+            below a fixed threshold (0.05).
+        2.  **Size Filtering:** Discards boxes that are smaller than a minimum
+            size (1x1 pixels).
+        3.  **Class-wise NMS:** For each class independently, it applies NMS
+            with an IoU threshold of 0.5. This eliminates redundant, overlapping
+            boxes for the same object, keeping only the one with the highest score.
+        4.  **Sorting:** Sorts all surviving boxes from all classes by their
+            confidence score in descending order.
+        5.  **Top-K Selection:** Returns the top 100 highest-scoring predictions
+            across all classes for the final output.
 
         Args:
-            feature_map (torch.Tensor): feature map that came from image feature extractor (1x512x37x50)
-            proposals (torch.Tensor): proposals that came from rpn (2000x4)
-            image_shape (Tuple): original image shape
-            target (Dict): gt for training
-                target["labels"] - gt labels (1x6)
-                target["bboxes"] - gt bbox (1x6x4)
+            pred_boxes (torch.Tensor): The predicted bounding boxes for all classes.
+                Shape: (C * P, 4), where C is the number of classes and P is the
+                number of proposals. Format: [x1, y1, x2, y2].
+            pred_scores (torch.Tensor): The confidence scores for each predicted box.
+                Shape: (C * P,).
+            pred_labels (torch.Tensor): The class label for each predicted box.
+                Shape: (C * P,).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: A tuple containing the
+            filtered and refined boxes, scores, and labels.
+                - boxes (torch.Tensor): Shape (K, 4), where K <= 100.
+                - scores (torch.Tensor): Shape (K,).
+                - labels (torch.Tensor): Shape (K,).
+        """
+        #remove low scoring boxes (less than 0.05)
+        keep = torch.where(pred_scores > 0.05)[0]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+        
+        # remove small boxes (keep boxes with height and width greater than 1)
+        min_size = 1
+        ws, hs = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1] 
+        keep = torch.where((ws >= min_size) & (hs <= 1))[0]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+
+        # Class wise NMS
+        #1) for each class we pick boxes with that class label
+        #2) call nms (threshold of 0.5)
+        #3) keep only boxes which are filtered by nms  
+        keep_mask = torch.zeros_like(pred_scores, dtype=torch.bool)
+        for class_id in torch.unique(pred_labels):
+            curr_indices = torch.where(pred_labels == class_id)[0]
+            curr_keep_indices = torchvision.ops.nms(
+                pred_boxes[curr_indices],
+                pred_scores[curr_indices],
+                0.5
+            )
+            keep_mask[curr_indices[curr_keep_indices]] = True
+        keep_indices = torch.where(keep_mask)[0]   
+        
+        # Sort boxes based on their classification scores
+        post_nms_keep_indices = keep_indices[pred_scores[keep_indices].sort(
+            descending=True
+            )[1]]
+        
+        #return only top 100 detections for each image
+        keep = post_nms_keep_indices[:100]
+        pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
+        return pred_boxes, pred_scores, pred_labels
+
+    def forward(self, feature_map: torch.Tensor, proposals: torch.Tensor, image_shape: Tuple, target):
+        """Processes region proposals to produce final object detections or training losses.
+
+        This method acts as the second stage of the Faster R-CNN detector. It takes the
+        feature map from the backbone and region proposals from the RPN. Depending on
+        whether the model is in training or inference mode, its behavior changes.
+
+        TRAINING
+            - Assign ground truth boxes to proposals
+            - Sample positive and negative proposals
+            - Get classification and regression targets for proposals
+            - ROI pooling to get proposal features
+            - Call classification and regression layers
+            - Compute classification and localization loss
+            
+        INFERENCE
+            - ROI pooling to get proposal features
+            - Call classification and regression layers
+            - Convert proposals to predictions using box transformation prediction
+            - Filter boxes
+
+        Args:
+            feature_map (torch.Tensor): The feature map from the backbone network.
+                Example shape: `(1, 512, 37, 50)`.
+            proposals (torch.Tensor): The region proposals generated by the RPN.
+                Example shape: `(2000, 4)`.
+            image_shape (Tuple): A tuple representing the original image dimensions
+                as `(height, width)`.
+            target (Dict): A dictionary containing ground truth information, used only
+                during training. It contains:
+                - `labels` (torch.Tensor): Ground truth labels for each object.
+                - `bboxes` (torch.Tensor): Ground truth bounding boxes.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing either losses (during training)
+            or final predictions (during inference).
+            - During training: `{"frcnn_classification_loss": Tensor, "frcnn_localization_loss": Tensor}`
+            - During inference: `{"boxes": Tensor, "scores": Tensor, "labels": Tensor}`
         """
         if self.training and target is not None:
-            gt_boxes = target["bboxes"][0] # shape example (6x4)
+            gt_boxes = target["bboxes"][0] # shape example (6, 4)
             gt_labels = target["labels"][0] # shape example (6,)
 
             # Assign labels and gt boxes to proposals
@@ -140,7 +240,7 @@ class ROIHead(nn.Module):
         
         # proposal_roi_pool_feats -> (number_proposals, 512, 7, 7)
         proposal_roi_pool_feats = torchvision.ops.roi_pool(
-            feature_map, # (1, 512, 37, 50)
+            feature_map, # eg.: (1, 512, 37, 50)
             [proposals], # (number_proposals, 4)
             output_size=self.pool_size, # 7
             spatial_scale=spatial_scale
@@ -157,9 +257,8 @@ class ROIHead(nn.Module):
         cls_scores = self.cls_layer(box_fc_7) # cls_scores -> (number_proposals, num_classes) eg.: (128, 21)
         
         # Bbox regression layer
-        box_transform_pred = self.bbox_reg_layer(box_fc_7) # box_transform_pred -> (number_proposals, num_classes * 4) eg.: (128, 84)
+        box_transform_pred = self.bbox_reg_layer(box_fc_7) # box_transform_pred -> (number_proposals, num_classes * 4) eg.: (128, 21 * 4)
         
-    
         num_boxes, num_classes = cls_scores.shape
         box_transform_pred = box_transform_pred.reshape(num_boxes, num_classes, 4) # Reshape box transformation predictions to (number_proposals, number_classes, 4)
         
@@ -171,4 +270,54 @@ class ROIHead(nn.Module):
                 labels
             )
             
+            #Computing localization loss only for foreground proposals
+            fg_proposals_idxs = torch.where(labels > 0)[0] # get only foreground proposals
+            fg_class_labels = labels[fg_proposals_idxs] # get foreground class labels 
+            localization_loss = torch.nn.functional.smooth_l1_loss(
+                box_transform_pred[fg_proposals_idxs, fg_class_labels],
+                regression_targets[fg_proposals_idxs],
+                beta=1/9,
+                reduction='sum'
+            )
+            localization_loss = localization_loss/labels.numel() # normalizing localization loss
+            
+            frcnn_output["frcnn_classification_loss"] = classification_loss
+            frcnn_output["frcnn_localization_loss"] = localization_loss
+            return frcnn_output
+        else:
+            # Apply transformation predictions to proposals
+            # pred_boxes -> (number_proposals, number_classes, 4) eg.: (128, 21, 4)
+            pred_boxes = apply_regression_pred_to_anchors_or_proposals(
+                box_transform_pred,
+                proposals
+            )
+            
+            # pred_scores -> (number_proposals, number_classes) eg.: (128, 21)
+            pred_scores = torch.nn.functional.softmax(cls_scores, dim=-1) # get predicted classification scores probabilities
+            
+            # Filtering proposals as predictions boxes
+            pred_boxes = clamp_boxes_to_image_boundary(pred_boxes, image_shape) # Clamp boxes to be inside image boundary
+
+            # Create labels for each prediction (class indexes)
+            pred_labels = torch.arange(num_classes, device=cls_scores.device) # 0..21
+            pred_labels = pred_labels.view(1, -1).expand_as(pred_scores) # expand pred_labels to be the same shape as pred_scores (number_proposals, number_classes) eg.:  (128, 21)
+            
+            # remove background class predictions
+            pred_boxes = pred_boxes[:, 1:] # pred_boxes -> (num_proposals, num_classes-1, 4) eg.: (128, 20, 4)
+            pred_scores = pred_scores[:, 1:] # pred_scores -> (num_proposals, num_classes-1) eg.: (128, 20)
+            pred_labels = pred_labels[:, 1:] # pred_labels -> (num_proposals, num_classes-1) eg.: (128, 20)
+            
+            # Each of 128 proposals have prediction boxes for all classes. 
+            # That is the reason why we have pred_boxes as dim (num_proposals, num_classes-1, 4) 
+            # So instead of having, for example, 128 prediction boxes, we would have 128 * 20 = 2560 boxes
+            pred_boxes = pred_boxes.reshape(-1, 4) # pred_boxes -> (num_proposals * (num_classes-1), 4) eg.: (2560, 4)
+            pred_scores = pred_scores.reshape(-1) # pred_scores -> (num_proposals * (num_classes-1), ) eg.: (2560, )
+            pred_labels = pred_labels.reshape(-1) # pred_labels -> (num_proposals * (num_classes-1), ) eg.: (2560, )
+            
+            pred_boxes, pred_scores, pred_labels  = self.filter_predictions(pred_boxes, pred_scores, pred_labels )
+            frcnn_output["boxes"] = pred_boxes
+            frcnn_output["scores"] = pred_scores
+            frcnn_output["labels"] = pred_labels
+            
+            return frcnn_output
             
