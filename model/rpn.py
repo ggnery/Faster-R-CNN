@@ -289,12 +289,12 @@ def get_iou(boxes1 :torch.Tensor, boxes2 :torch.Tensor) -> torch.Tensor:
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
     
     #Get top left x1, y1 in each possible box pair intersection
-    x_left = torch.max(boxes1[:, None, 0], boxes2[:, None, 0]) # Get top left x (NxM)
-    y_top = torch.max(boxes1[:, None, 1], boxes2[:, None, 1]) # Get top left y (NxM)
+    x_left = torch.max(boxes1[:, None, 0], boxes2[:, 0]) # Get top left x (NxM)
+    y_top = torch.max(boxes1[:, None, 1], boxes2[:, 1]) # Get top left y (NxM)
     
     #Get bottom right x2, y2 in each possible box pair intersection
-    x_right = torch.min(boxes1[:, None, 2], boxes2[:, None, 2]) # Get bottom right x (NxM)
-    y_bottom = torch.min(boxes1[:, None, 3], boxes2[:, None, 3]) # Get bottom right y (NxM)
+    x_right = torch.min(boxes1[:, None, 2], boxes2[:, 2]) # Get bottom right x (NxM)
+    y_bottom = torch.min(boxes1[:, None, 3], boxes2[:, 3]) # Get bottom right y (NxM)
     
     # Since intersection area cannot be negative, clamp(min=0) ensures that:
     # If boxes don't overlap → width/height becomes 0 → intersection area = 0
@@ -731,7 +731,7 @@ class RegionProposalNetwork(nn.Module):
         """
         
         # get IoU matrix with shape (gt_boxes, num_anchors)
-        iou_matrix = get_iou(gt_boxes, iou_matrix) # eg -> 6 x 16650
+        iou_matrix = get_iou(gt_boxes, anchors) # eg -> 6 x 16650
         
         # For each anchor get best ground truth box index
         # Goes column by column (each column is one anchor)
@@ -1021,7 +1021,7 @@ class RegionProposalNetwork(nn.Module):
         # classification_scores -> (batch, Numer of anchors per location, h_feat, w_feat)
         number_of_anchors_per_location = classification_scores.size(1)
         classification_scores = classification_scores.permute(0,2,3,1) # classification_scores -> (batch, h_feat, w_feat, Numer of anchors per location)
-        classification_scores.reshape(-1, 1) # classification_scores -> (batch * h_feat * w_feat * Numer of anchors per location, 1)
+        classification_scores = classification_scores.reshape(-1, 1) # classification_scores -> (batch * h_feat * w_feat * Numer of anchors per location, 1)
         
         # reshaping box_transformation_preds scores to be the same shape as anchors
         # box_transformation_preds -> (Batch, Number of Anchors per location * 4, h_feat, w_feat)
@@ -1038,7 +1038,8 @@ class RegionProposalNetwork(nn.Module):
         
         # Transforming generated anchors according to box_transform_pred
         proposals = apply_regression_pred_to_anchors_or_proposals(
-            box_transformation_preds.detach().reshape(-1, 1, 4) # (Batch * Number of Anchors per location * h_feat * w_feat, 1, 4) where the 1 here is class (background or foregroung)
+            box_transformation_preds.detach().reshape(-1, 1, 4), # (Batch * Number of Anchors per location * h_feat * w_feat, 1, 4) where the 1 here is class (background or foregroung)
+            anchors
         )
         
         #Filtering the proposals
