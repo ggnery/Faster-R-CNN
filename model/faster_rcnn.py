@@ -1,15 +1,30 @@
 from torch import nn
+from typing import Tuple
 import torch
 import torchvision
 from .rpn import RegionProposalNetwork 
 from .roi_head import ROIHead
 
-def transform_boxes_to_original_size(boxes, new_size, original_size):
+def transform_boxes_to_original_size(boxes: torch.Tensor, new_size: torch.Tensor, original_size: torch.Tensor) -> torch.Tensor:
+    """
+    Transforms bounding box coordinates from a resized image scale back to the original image scale.
+
+    Args:
+        boxes (torch.Tensor): A tensor of shape [N, 4] containing the bounding boxes
+                              in (xmin, ymin, xmax, ymax) format, corresponding to the resized image.
+        new_size (torch.Tensor): A tensor representing the size of the resized image [height, width].
+        original_size (torch.Tensor): A tensor representing the size of the original image [height, width].
+
+    Returns:
+        torch.Tensor: A tensor of shape [N, 4] with bounding boxes scaled to the original image dimensions.
+    """
+    # Calculate h and w scales [original_image_h/resized_image_h, original_image_w/resized_image_w]
     ratios = [
             torch.tensor(s_orig, dtype=torch.float32, device=boxes.device) / torch.tensor(s, dtype=torch.float32, device=boxes.device) 
             for s, s_orig in zip(new_size, original_size)
         ]
     
+    # resize the box coordinates accordingly to image resize scale
     ratio_height, ratio_width = ratios
     xmin, ymin, xmax, ymax = boxes.unbind(1)
     xmin = xmin * ratio_width
@@ -21,6 +36,17 @@ def transform_boxes_to_original_size(boxes, new_size, original_size):
 
 class FasterRCNN(nn.Module):
     def __init__(self, num_classes = 21):
+        """
+        Initializes the Faster R-CNN model.
+
+        This module integrates a backbone feature extractor (VGG16), a Region Proposal Network (RPN)
+        to generate object proposals, and an ROI Head to classify these proposals and refine their
+        bounding boxes.
+
+        Args:
+            num_classes (int): The number of classes for the classifier, including the background.
+                            Defaults to 21.
+        """
         super(FasterRCNN, self).__init__()
         
         #Backbone is vgg16 without last max pooling layers and classification layers
@@ -43,26 +69,42 @@ class FasterRCNN(nn.Module):
         self.min_size = 600
         self.max_size = 1000
         
-    def normalize_resize_image_and_boxes(self, image: torch.Tensor, bboxes: torch.Tensor):
+    def normalize_resize_image_and_boxes(self, image: torch.Tensor, bboxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Normalizes and resizes an image and its corresponding bounding boxes.
+
+        The image is normalized using ImageNet's mean and std. It is then resized such that
+        its smaller dimension is `self.min_size` (e.g., 600 pixels), while ensuring its
+        larger dimension does not exceed `self.max_size` (e.g., 1000 pixels).
+        The bounding boxes are scaled accordingly.
+
+        Args:
+            image (torch.Tensor): The input image tensor of shape [C, H, W].
+            bboxes (torch.Tensor): A tensor of ground-truth bounding boxes of shape [1, N, 4].
+                                   Can be None if not in training mode.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the processed image
+                                               and the resized bounding boxes.
+        """
         # Normalize
         mean = torch.as_tensor( self.image_mean, dtype=image.dtype, device=image.device)
         std = torch.as_tensor( self.image_std, dtype=image.dtype, device=image.device)
         image = (image - mean[:, None, None]) / std[:, None, None]
         ######
         
-        # Resize such that lower dim is scaled to 600
-        # but larger dim not more than 1000
+        # Resize such that lower dim is scaled to 600 but larger dim not more than 1000
         h, w = image.shape[-2:]
         im_shape = torch.tensor(image.shape[-2:])
         min_size = torch.min(im_shape).to(dtype=torch.float32)
         max_size = torch.max(im_shape).to(dtype=torch.float32)
         
-        # A partir daqui fui no automatico
+        # scale ensures that if resizing the smaller dimension to 600, the larger dimentsion will be less than 1000 
         # eg.: scale = 1.6
         scale = torch.min(
             float(self.min_size) / min_size,
             float(self.max_size) / max_size
-        )
+        ) 
         
         scale_factor = scale.item()
         #Resize image based on scale
@@ -78,11 +120,13 @@ class FasterRCNN(nn.Module):
         # Resize boxes
         # As the image was resized, the gt boxes need also to be resized
         if bboxes is not None:
+            # Calculate h and w scales [resized_image_h/original_image_h, resized_image_w/original_image_w]
             ratios = [
-                torch.tensor(s, dtype= torch.float32, device=bboxes.device) / torch.tensor(s_orig, dtype= torch.float32, device=bboxes.device) 
+                torch.tensor(s, dtype=torch.float32, device=bboxes.device) / torch.tensor(s_orig, dtype=torch.float32, device=bboxes.device) 
                 for s, s_orig in zip(image.shape[-2:], (h,w))
             ]
             
+            # resize the box coordinates accordingly to image resize scale
             ratio_height, ratio_width = ratios
             xmin, ymin, xmax, ymax = bboxes.unbind(2)
             xmin = xmin * ratio_width
@@ -99,10 +143,24 @@ class FasterRCNN(nn.Module):
         return image, bboxes 
         
     def forward(self, image: torch.Tensor, target = None):
+        """
+        Defines the forward pass of the Faster R-CNN model.
+
+        Args:
+            image (torch.Tensor): The input image tensor of shape [1, C, H, W].
+            target (dict, optional): A dictionary containing ground-truth data, primarily
+                                     'bboxes' and 'labels'. Required for training. Defaults to None.
+
+        Returns:
+            Tuple[dict, dict]: A tuple containing two dictionaries:
+                               - rpn_output: Losses and proposals from the RPN.
+                               - frcnn_output: Losses, boxes, labels, and scores from the ROI Head.
+        """
         old_shape = image.shape[-2:] # eg.: (375, 500)
-        if self.training:
-            # Normalize and resize boxes
-            # image -> eg.: (1,3, 600, 800)
+        
+        # image -> eg.: (1,3, 600, 800)
+        if self.training:    
+            # Normalize and resize boxes  
             image, bboxes = self.normalize_resize_image_and_boxes(image, target["bboxes"])
             target["bboxes"] = bboxes
         else:
@@ -119,7 +177,7 @@ class FasterRCNN(nn.Module):
         frcnn_output = self.roi_head(feat, proposals, image.shape[-2:], target)
         
         if not self.training:
-            # Transform boxes to original image dimension
+            # Transform boxes back to original image dimension
             frcnn_output["boxes"] = transform_boxes_to_original_size(frcnn_output["boxes"], image.shape[-2:], old_shape)
 
         return rpn_output, frcnn_output

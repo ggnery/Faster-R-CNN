@@ -7,6 +7,41 @@ from .rpn import get_iou, sample_positive_negative, boxes_to_transformation_targ
 
 class ROIHead(nn.Module):
     def __init__(self, num_classes = 21, in_channels = 512):
+        """
+        Initializes the Region of Interest (ROI) Head for a Faster R-CNN model.
+
+        The ROIHead is responsible for taking region proposals from the Region Proposal Network (RPN)
+        and refining them into final object detections by performing classification and bounding box regression.
+
+        Args:
+            num_classes (int, optional): The total number of object classes, including the background class.
+                                         Defaults to 21.
+            in_channels (int, optional): The number of input channels from the feature map, which is
+                                         typically the output channel dimension of the backbone network
+                                         (e.g., VGG). Defaults to 512.
+
+        Attributes:
+            num_classes (int): Stores the number of classes.
+            pool_size (int): The target output size (width and height) of the ROI pooling layer.
+                             This determines the fixed size of features extracted for each proposal.
+                             A common value is 7, resulting in a 7x7 feature map.
+            fc_inner_dim (int): The dimension of the inner fully connected layers (fc6 and fc7).
+                                 These layers process the pooled features before the final
+                                 classification and regression layers.
+
+            fc6 (nn.Linear): The first fully connected layer.
+                             Input features: `in_channels * pool_size * pool_size` (flattened pooled features).
+                             Output features: `fc_inner_dim`.
+            fc7 (nn.Linear): The second fully connected layer.
+                             Input features: `fc_inner_dim`.
+                             Output features: `fc_inner_dim`.
+            cls_layer (nn.Linear): The classification layer.
+                                   Input features: `fc_inner_dim`.
+                                   Output features: `num_classes` (scores for each class, including background).
+            bbox_reg_layer (nn.Linear): The bounding box regression layer.
+                                        Input features: `fc_inner_dim`.
+                                        Output features: `num_classes * 4` (4 regression offsets for each class).
+        """
         super(ROIHead, self).__init__()
         self.num_classes = num_classes
         self.pool_size = 7 # output size of pooling layer
@@ -15,13 +50,13 @@ class ROIHead(nn.Module):
         #1st fc after pooling
         self.fc6 = nn.Linear(
             in_channels*self.pool_size*self.pool_size, # input example (512*7*7, )   
-            self.fc_inner_dim # output example (1024, )
+            self.fc_inner_dim 
         )
         
         #2nd fc after pooling
         self.fc7 = nn.Linear(
-            self.fc_inner_dim, # input example (1024, )  
-            self.fc_inner_dim # input example (1024, )
+            self.fc_inner_dim,  
+            self.fc_inner_dim 
         )
         
         # classification layer
@@ -32,8 +67,8 @@ class ROIHead(nn.Module):
         
         #bbox regression layer
         self.bbox_reg_layer = nn.Linear(
-            self.fc_inner_dim, # (1024, )
-            self.num_classes * 4 # (21*4 ,)
+            self.fc_inner_dim, 
+            self.num_classes * 4 
         )
         
     def assign_target_to_proposals(self, proposals: torch.Tensor, gt_boxes: torch.Tensor, gt_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:        
