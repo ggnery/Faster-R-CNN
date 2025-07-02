@@ -164,7 +164,6 @@ def load_model_and_dataset(args):
     
     
     dataset_config = config['dataset_params']
-    model_config = config['model_params']
     train_config = config['train_params']
     
     seed = train_config['seed']
