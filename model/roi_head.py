@@ -46,7 +46,7 @@ class ROIHead(nn.Module):
         self.num_classes = num_classes
         self.pool_size = 7 # output size of pooling layer
         self.fc_inner_dim = 1024 # dimension of FC layers
-        
+        self.low_score_threshold = 0.05
         #1st fc after pooling
         self.fc6 = nn.Linear(
             in_channels*self.pool_size*self.pool_size, # input example (512*7*7, )   
@@ -174,8 +174,8 @@ class ROIHead(nn.Module):
                 - scores (torch.Tensor): Shape (K,).
                 - labels (torch.Tensor): Shape (K,).
         """
-        #remove low scoring boxes (less than 0.05)
-        keep = torch.where(pred_scores > 0.05)[0]
+        #remove low scoring boxes
+        keep = torch.where(pred_scores > self.low_score_threshold)[0]
         pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
         
         # remove small boxes (keep boxes with height and width greater than 1)
