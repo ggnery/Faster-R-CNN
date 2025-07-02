@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torchvision
 from typing import Tuple
+import math
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tensor, anchors_or_proposals: torch.Tensor) -> torch.Tensor:
+def apply_regression_pred_to_anchors_or_proposals(box_transform_pred: torch.Tensor, anchors_or_proposals: torch.Tensor) -> torch.Tensor:
     """Applies predicted regression transformations to reference boxes to generate refined bounding boxes.
     
     This function implements the standard bounding box regression used in object detection
@@ -54,8 +55,8 @@ def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tens
            - x2 = Gx + Gw/2, y2 = Gy + Gh/2
      
     """
-    box_trasnform_pred = box_trasnform_pred.reshape(
-        box_trasnform_pred.size(0), -1, 4
+    box_transform_pred = box_transform_pred.reshape(
+        box_transform_pred.size(0), -1, 4
     )
     
     #get xs, cy, w, h from x1, y1, x2, y2 of anchors/proposals
@@ -66,10 +67,13 @@ def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tens
     
     #Transformation predictions (tx, ty, tw, th)
     # all bellow have dimension (num_anchors_or_proposals, num_classes, 1) 
-    tx = box_trasnform_pred[..., 0]  
-    ty = box_trasnform_pred[..., 1]
-    tw = box_trasnform_pred[..., 2]
-    th = box_trasnform_pred[..., 3]
+    tx = box_transform_pred[..., 0]  
+    ty = box_transform_pred[..., 1]
+    tw = box_transform_pred[..., 2]
+    th = box_transform_pred[..., 3]
+    
+    tw = torch.clamp(tw, max=math.log(1000.0 / 16))
+    th = torch.clamp(th, max=math.log(1000.0 / 16))
     
     # Applying trasnformations
     # P -> Anchor box
@@ -95,7 +99,6 @@ def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tens
     
     return pred_boxes
     
-
 def clamp_boxes_to_image_boundary(boxes: torch.Tensor, image_shape) -> torch.Tensor:
     """Clips bounding box coordinates to ensure they lie within image boundaries.
     
@@ -205,7 +208,7 @@ def get_iou(boxes1 :torch.Tensor, boxes2 :torch.Tensor) -> torch.Tensor:
     union = area1[:,None] + area2 - intersection_area
     
     return intersection_area/union #(NxM)
-  
+
 def boxes_to_transformation_targets(ground_truth_boxes: torch.Tensor, anchors_or_proposals: torch.Tensor) -> torch.Tensor:  
     """Converts ground truth boxes and reference boxes into regression targets for training.
     
@@ -254,16 +257,15 @@ def boxes_to_transformation_targets(ground_truth_boxes: torch.Tensor, anchors_or
     target_tx = (gt_center_x - center_x) / widths # tx = (Gx - Px) / Pw
     target_ty = (gt_center_y - center_y) / heights # ty = (Gy - Py) / Ph
     target_tw = torch.log(gt_widths / widths) # tw = log(Gw/Pw)
-    target_dh = torch.log(gt_heights / heights) # th = log(Gh/Ph)
+    target_th = torch.log(gt_heights / heights) # th = log(Gh/Ph)
     
     regression_targets = torch.stack((
         target_tx,
         target_ty,
         target_tw,
-        target_dh
+        target_th
     ), dim=1)
     return regression_targets
-    
 def sample_positive_negative(labels: torch.Tensor, positive_count: int, total_count: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """Samples a balanced subset of positive and negative anchors for training.
     
@@ -330,7 +332,7 @@ def sample_positive_negative(labels: torch.Tensor, positive_count: int, total_co
     return sampled_neg_idx_mask, sampled_pos_idx_mask
 
 class RegionProposalNetwork(nn.Module):
-    def __init__(self, in_channels=512):
+    def __init__(self, in_channels, scales, aspect_ratios, model_config):
         """Initializes the Region Proposal Network (RPN) module for object detection.
     
         The RPN is a fully convolutional network that generates object proposals by
@@ -376,8 +378,22 @@ class RegionProposalNetwork(nn.Module):
         """
         
         super(RegionProposalNetwork, self).__init__()
-        self.scales = [128, 256, 512] # scales/areas for anchor boxes in feature map (128^2, 256^2 and 512^2)
-        self.aspect_ratios = [0.5, 1, 2] # aspect_ratios for anchor boxes in feature map (1:2, 1:1, 2:1)
+        self.scales = scales # scales/areas for anchor boxes in feature map (128^2, 256^2 and 512^2)
+        self.aspect_ratios = aspect_ratios # aspect_ratios for anchor boxes in feature map (1:2, 1:1, 2:1)
+        
+        self.low_iou_threshold =  model_config["rpn_bg_threshold"] # background threshold for rpn (default = 0.3)
+        self.high_iou_threshold = model_config["rpn_fg_threshold"] # foreground threshold for rpn (default = 0.7)
+        
+        self.rpn_nms_threshold = model_config["rpn_nms_threshold"] # threshold for NMS in filter_proposals function (default = 0.7)
+        
+        self.rpn_batch_size = model_config["rpn_batch_size"] # total batch for sampling positive and negative anchors (default = 256)
+        self.rpn_pos_count = int(model_config["rpn_pos_fraction"] * self.rpn_batch_size) # total of positive anchors in sampling (default = 256 * 0.5 = 128)
+        #Note: rpn_pos_fraction is the fraction of positive anchors in rpn_batch_size
+        
+        #Pre NMS topk anchors in filter_proposals function (default = 12000 in train and 6000 in test)
+        self.rpn_prenms_topk = model_config['rpn_train_prenms_topk'] if self.training else model_config['rpn_test_prenms_topk']
+        #Post NMS topk anchors in filter_proposals function (default = 2000 in train and 300 in test)
+        self.rpn_topk = model_config['rpn_train_topk'] if self.training else model_config['rpn_test_topk'] 
         
         self.num_anchors = len(self.scales) * len(self.aspect_ratios) #Each feature map cell will have 3x3 = 9 anchor boxes  
         
@@ -400,6 +416,11 @@ class RegionProposalNetwork(nn.Module):
                                         out_channels=self.num_anchors * 4,# (p0_tx, p0_ty, p0_th, p0_tw, ..., pk_tx, pk_ty, pk_th, pk_tw)
                                         kernel_size=1,
                                         stride=1) 
+        
+        #Initializing weights and bias 
+        for layer in [self.rpn_conv, self.classification_layer, self.bbox_regressor_layer]:
+            torch.nn.init.normal_(layer.weight, std=0.01)
+            torch.nn.init.constant_(layer.bias, 0)
     
     def generate_anchors(self, image: torch.Tensor, feature_map: torch.Tensor) -> torch.Tensor:        
         """Generates anchor boxes across the entire image based on the feature map grid.
@@ -476,6 +497,7 @@ class RegionProposalNetwork(nn.Module):
         # obs: we shift the anchors in feature map proportionally to the original image sizes, this explains the stride_h
         shifts_y = torch.arange(0, grid_h, dtype=torch.int32, device=feature_map.device) * stride_h
 
+        # Create a grid using these shifts
         # Do cartesian product between shifts to get anchor coordinates in feature map
         # torch.meshgrid reference: https://docs.pytorch.org/docs/stable/generated/torch.meshgrid.html
         shifts_y, shifts_x = torch.meshgrid(shifts_y, shifts_x, indexing="ij")
@@ -554,10 +576,10 @@ class RegionProposalNetwork(nn.Module):
         #This copy will be needed later to add low quality boxes 
         best_match_gt_idx_pre_threshold = best_match_gt_index.clone()
         
-        bellow_low_threshold = best_match_iou < 0.3 # background anchors
-        between_threshold = (best_match_iou >= 0.3) & (best_match_iou < 0.7) # ignored anchors
+        below_low_threshold = best_match_iou < self.low_iou_threshold # background anchors
+        between_threshold = (best_match_iou >= self.low_iou_threshold) & (best_match_iou < self.high_iou_threshold) # ignored anchors
         
-        best_match_gt_index[bellow_low_threshold] = -1 # -1 is background
+        best_match_gt_index[below_low_threshold] = -1 # -1 is background
         best_match_gt_index[between_threshold] = -2 # -2 is ignored
         
         # LOW QUALITY POSITIVE anchor boxes process
@@ -652,19 +674,30 @@ class RegionProposalNetwork(nn.Module):
         #Pre NMS filtering
         classification_scores = classification_scores.reshape(-1) # flatten proposal classification scores
         classification_scores = torch.sigmoid(classification_scores)
-        if classification_scores.shape[0] < 10000:
-            _, top_n_idx = classification_scores.topk(classification_scores.shape[0]) # get top k<10000 proposal based on classification scores (foreground or background)
-        else:
-            _, top_n_idx = classification_scores.topk(10000) # get top 10000 proposal based on classification scores (foreground or background)
+        
+        # get top k<rpn_prenms_topk proposal boxes based on classification scores (foreground or background)
+        _, top_n_idx = classification_scores.topk(min(self.rpn_prenms_topk, len(classification_scores)))
+        
         classification_scores = classification_scores[top_n_idx]
         proposals = proposals[top_n_idx] # filter only top 10000 proposals
         
         # Clamp boxes to image boundary
         proposals = clamp_boxes_to_image_boundary(proposals, image_shape)
         
+        # Small boxes boxes based on width and height filtering (h and w >= 16)
+        # Hyperparameter???
+        min_size = 16
+        ws, hs = proposals[:, 2] - proposals[:, 0], proposals[:, 3] - proposals[:, 1] 
+        keep = (ws >= min_size) & (hs >= min_size)
+        keep = torch.where(keep)[0]
+        proposals = proposals[keep]
+        classification_scores = classification_scores[keep] 
+        
         #NMS based on objectness
         keep_mask = torch.zeros_like(classification_scores, dtype=torch.bool) # mask with proposals to keep
-        keep_indices = torchvision.ops.nms(proposals, classification_scores, 0.7) # apply nms with 0.7 threshold
+        keep_indices = torchvision.ops.nms(proposals, classification_scores, self.rpn_nms_threshold) # apply nms with 0.7 threshold
+        keep_mask[keep_indices] = True
+        keep_indices = torch.where(keep_mask)[0]
         
         #sort keep_indices by classification scores
         post_nms_keep_indices = keep_indices[
@@ -672,11 +705,11 @@ class RegionProposalNetwork(nn.Module):
         ]
         
         # Post NMS topk = 2000 filtering
-        proposals = proposals[post_nms_keep_indices[:2000]]
-        classification_scores = classification_scores[post_nms_keep_indices[:2000]]
+        proposals = proposals[post_nms_keep_indices[:self.rpn_topk]]
+        classification_scores = classification_scores[post_nms_keep_indices[:self.rpn_topk]]
         
         return proposals, classification_scores
-        
+     
     def forward(self, image, feature_map, target):
         """Executes the Region Proposal Network forward pass for object proposal generation.
     
@@ -795,14 +828,14 @@ class RegionProposalNetwork(nn.Module):
         
         #Filtering the proposals
         proposals = proposals.reshape(proposals.size(0), 4) # (Batch * Number of Anchors per location * h_feat * w_feat, 4)
-        proposals, scores = self.filter_proposals(proposals, classification_scores, image.shape)
+        proposals, scores = self.filter_proposals(proposals, classification_scores.detach(), image.shape)
 
         rpn_output = {
             "proposals": proposals, # eg: proposals -> (2000 x 4)
-            "scores": scores # eg: scores -> (2000 x 4)
+            "scores": scores # eg: scores -> (2000,)
         }
             
-        if not self.train or target is None:
+        if not self.training or target is None:
             return rpn_output
         else:
             # In train mode, assign ground truth values to anchors
@@ -816,7 +849,10 @@ class RegionProposalNetwork(nn.Module):
             regression_targets = boxes_to_transformation_targets(matched_gt_boxes_for_anchors, anchors) # 16650x4
             
             # Sample positive (foreground) and negative anchors (background) for training
-            sampled_neg_idx_mask, sampled_pos_idx_mask = sample_positive_negative(labels_for_anchors, positive_count=128, total_count=256)
+            sampled_neg_idx_mask, sampled_pos_idx_mask = sample_positive_negative(
+                labels_for_anchors, 
+                positive_count=self.rpn_pos_count, 
+                total_count=self.rpn_batch_size)
             sampled_idxs = torch.where(sampled_pos_idx_mask | sampled_neg_idx_mask)[0] #get positive and negative anchor idxs
             
             #Smooth L1 loss for proposal regression (positive only)
@@ -830,12 +866,12 @@ class RegionProposalNetwork(nn.Module):
             )
             
             # Binary cross entropy loss between classification scores and labels of sampled indexes (positive and negative)
-            classificatio_loss = torch.nn.functional.binary_cross_entropy_with_logits(
+            classification_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 classification_scores[sampled_idxs].flatten(), # classification_scores -> predicted classification scores for anchors after 1x1 conv layer
                 labels_for_anchors[sampled_idxs].flatten() # labels_for_anchors -> ground truth classification scores for anchors
             )
             
-            rpn_output["rpn_classification_loss"] = classificatio_loss
+            rpn_output["rpn_classification_loss"] = classification_loss
             rpn_output["rpn_localization_loss"] = localization_loss
             
             return rpn_output
