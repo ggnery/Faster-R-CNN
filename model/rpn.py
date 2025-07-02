@@ -904,7 +904,10 @@ class RegionProposalNetwork(nn.Module):
         #Pre NMS filtering
         classification_scores = classification_scores.reshape(-1) # flatten proposal classification scores
         classification_scores = torch.sigmoid(classification_scores)
-        _, top_n_idx = classification_scores.topk(10000) # get top 10000 proposal based on classification scores (foreground or background)
+        if classification_scores.shape[0] < 10000:
+            _, top_n_idx = classification_scores.topk(classification_scores.shape[0]) # get top k<10000 proposal based on classification scores (foreground or background)
+        else:
+            _, top_n_idx = classification_scores.topk(10000) # get top 10000 proposal based on classification scores (foreground or background)
         classification_scores = classification_scores[top_n_idx]
         proposals = proposals[top_n_idx] # filter only top 10000 proposals
         
