@@ -52,40 +52,7 @@ def apply_regression_pred_to_anchors_or_proposals(box_trasnform_pred: torch.Tens
         3. Convert to corners:
            - x1 = Gx - Gw/2, y1 = Gy - Gh/2
            - x2 = Gx + Gw/2, y2 = Gy + Gh/2
-    
-    Why this parameterization?
-        1. **Scale invariance**: Normalizing by anchor size makes the same tx/ty values
-           represent the same relative shift regardless of anchor scale
-        2. **Bounded predictions**: Log-space size predictions prevent negative sizes
-           and make extreme size changes (very large tw/th) less likely
-        3. **Training stability**: This parameterization has better gradients than
-           direct coordinate regression, especially for small objects
-    
-    Example:
-        >>> # RPN example (binary classification)
-        >>> anchors = torch.tensor([[100, 100, 200, 200],  # 100x100 anchor
-        ...                         [150, 150, 350, 350]])  # 200x200 anchor
-        >>> # Predict small shifts and slight size increases
-        >>> deltas = torch.tensor([[0.1, 0.1, 0.1, 0.1],   # 10% center shift, ~10% size increase
-        ...                        [0.0, 0.0, 0.0, 0.0]])   # No change
-        >>> pred_boxes = apply_regression_pred_to_anchors_or_proposals(deltas, anchors)
-        >>> # pred_boxes[0] ≈ [105, 105, 215, 215] (shifted and enlarged)
-        >>> # pred_boxes[1] = [150, 150, 350, 350] (unchanged)
-        
-        >>> # RCNN example (multi-class)
-        >>> proposals = torch.tensor([[50, 50, 150, 150]])  # Single 100x100 proposal
-        >>> # Predictions for 3 classes
-        >>> deltas = torch.tensor([[[0.2, 0.0, 0.0, 0.0],   # Class 0: shift right
-        ...                         [0.0, 0.2, 0.0, 0.0],   # Class 1: shift down
-        ...                         [-0.1, -0.1, 0.2, 0.2]]])# Class 2: shift up-left, enlarge
-        >>> pred_boxes = apply_regression_pred_to_anchors_or_proposals(deltas, proposals)
-        >>> # pred_boxes.shape = (1, 3, 4) - one box per class
-    
-    Note:
-        - The exponential in size prediction can cause numerical instability for very
-          large tw/th values. Some implementations clip these values (e.g., tw, th < 4.0)
-        - The function assumes anchors_or_proposals are valid (x2 > x1, y2 > y1)
-        - No post-processing (clipping to image bounds, removing invalid boxes) is done here
+     
     """
     box_trasnform_pred = box_trasnform_pred.reshape(
         box_trasnform_pred.size(0), -1, 4
@@ -137,12 +104,6 @@ def clamp_boxes_to_image_boundary(boxes: torch.Tensor, image_shape) -> torch.Ten
     data augmentation. It ensures all box coordinates are valid for downstream
     processing without removing any boxes.
     
-    The clipping is essential because:
-    1. Regression predictions can push boxes outside image bounds
-    2. Anchors near image edges often extend beyond boundaries
-    3. Invalid coordinates can cause errors in ROI pooling/alignment
-    4. Visualization requires valid coordinates
-    
     Args:
         boxes (torch.Tensor): Bounding boxes to clip. Shape: (..., 4) where the last
             dimension contains [x1, y1, x2, y2] in corner format. The function handles
@@ -164,43 +125,6 @@ def clamp_boxes_to_image_boundary(boxes: torch.Tensor, image_shape) -> torch.Ten
             - 0 <= x1, x2 <= width
             - 0 <= y1, y2 <= height
             
-    Behavior:
-        - Coordinates less than 0 are set to 0
-        - x-coordinates greater than width are set to width
-        - y-coordinates greater than height are set to height
-        - Preserves all boxes (doesn't filter out tiny/invalid boxes)
-        - Maintains box format (doesn't fix inverted boxes where x2 < x1)
-    
-    Example:
-        >>> # Single image case
-        >>> boxes = torch.tensor([[10, 20, 100, 120],    # Valid box
-        ...                       [-5, 30, 90, 140],     # x1 < 0, y2 > height
-        ...                       [50, 60, 850, 700]])   # x2 > width, y2 > height
-        >>> image_shape = (600, 800)  # 600x800 image
-        >>> clipped = clamp_boxes_to_image_boundary(boxes, image_shape)
-        >>> # clipped[0] = [10, 20, 100, 120]    # Unchanged (was valid)
-        >>> # clipped[1] = [0, 30, 90, 140]      # x1 clamped to 0
-        >>> # clipped[2] = [50, 60, 800, 600]    # x2, y2 clamped to image bounds
-        
-        >>> # Multi-class predictions case
-        >>> boxes = torch.randn(100, 5, 4) * 1000  # 100 proposals, 5 classes each
-        >>> image_shape = (1024, 768)
-        >>> clipped = clamp_boxes_to_image_boundary(boxes, image_shape)
-        >>> assert clipped.shape == (100, 5, 4)
-        >>> assert (clipped[..., [0, 2]] <= 768).all()  # All x-coords within width
-        >>> assert (clipped[..., [1, 3]] <= 1024).all()  # All y-coords within height
-    
-    Implementation Notes:
-        - Uses tensor slicing with ellipsis (...) to handle arbitrary batch dimensions
-        - Clamps in-place for memory efficiency
-        - Orders operations to minimize temporary tensor creation
-        - The function is differentiable (clamp maintains gradients within bounds)
-    
-    Edge Cases:
-        - Empty boxes (x1=x2 or y1=y2) remain empty after clipping
-        - Inverted boxes (x2<x1 or y2<y1) remain inverted - this function doesn't fix them
-        - Boxes entirely outside image bounds become edge-aligned boxes
-        - For fractional coordinates, clamp preserves sub-pixel precision
     """
     boxes_x1 = boxes[..., 0]
     boxes_y1 = boxes[..., 1]
@@ -261,28 +185,6 @@ def get_iou(boxes1 :torch.Tensor, boxes2 :torch.Tensor) -> torch.Tensor:
         4. Compute union area: area1 + area2 - intersection
         5. Return intersection / union
     
-    Example:
-        >>> # Ground truth boxes
-        >>> gt_boxes = torch.tensor([[10, 10, 50, 50],    # 40x40 box
-        ...                          [60, 60, 100, 100]])  # 40x40 box
-        >>> # Predicted boxes  
-        >>> pred_boxes = torch.tensor([[15, 15, 55, 55],    # 40x40 box, overlaps first GT
-        ...                            [58, 58, 98, 98],     # 40x40 box, overlaps second GT
-        ...                            [200, 200, 240, 240]]) # 40x40 box, no overlap
-        >>> iou_matrix = get_iou(gt_boxes, pred_boxes)
-        >>> # iou_matrix[0, 0] ≈ 0.51 (good overlap between first GT and first pred)
-        >>> # iou_matrix[0, 2] = 0.0 (no overlap between first GT and third pred)
-        >>> # Shape: (2, 3)
-    
-    Performance Notes:
-        - Uses broadcasting to avoid loops: O(N×M) memory but very fast
-        - All operations are vectorized for GPU acceleration
-        - The clamp(min=0) operation handles non-overlapping boxes efficiently
-    
-    Common Usage:
-        - Anchor assignment in RPN: Match anchors to ground truth boxes
-        - NMS (Non-Maximum Suppression): Remove duplicate detections
-        - Evaluation metrics: Calculate mAP (mean Average Precision)
     """
     #Compute area of boxes (x2 - x1) * (y2 - y1)
     area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
@@ -336,45 +238,6 @@ def boxes_to_transformation_targets(ground_truth_boxes: torch.Tensor, anchors_or
             Each row contains [tx, ty, tw, th] representing the transformations
             needed to convert the corresponding anchor/proposal to its ground truth.
     
-    Mathematical Intuition:
-        1. **Center offsets (tx, ty)**: Normalized by anchor size to make the targets
-           scale-invariant. A tx=0.5 means "shift right by half the anchor width"
-           regardless of the anchor's absolute size.
-           
-        2. **Size ratios (tw, th)**: Using log-space prevents negative sizes and makes
-           multiplicative changes additive. tw=0 means "keep same size", tw=log(2)≈0.69
-           means "double the size", tw=log(0.5)≈-0.69 means "halve the size".
-    
-    Example:
-        >>> # Single anchor-GT pair example
-        >>> anchor = torch.tensor([[100, 100, 200, 200]])  # 100x100 box centered at (150, 150)
-        >>> gt_box = torch.tensor([[110, 110, 230, 230]])  # 120x120 box centered at (170, 170)
-        >>> targets = boxes_to_transformation_targets(gt_box, anchor)
-        >>> # targets ≈ [[0.2, 0.2, 0.182, 0.182]]
-        >>> # Interpretation:
-        >>> # - tx=0.2: shift center right by 20% of anchor width (0.2 * 100 = 20 pixels)
-        >>> # - ty=0.2: shift center down by 20% of anchor height  
-        >>> # - tw≈0.182: increase width by factor of exp(0.182)≈1.2 (from 100 to 120)
-        >>> # - th≈0.182: increase height by factor of exp(0.182)≈1.2
-        
-        >>> # Batch example for RPN training
-        >>> anchors = generate_anchors(image, feature_map)  # (16650, 4)
-        >>> labels, matched_gt = assign_targets_to_anchors(anchors, gt_boxes)
-        >>> regression_targets = boxes_to_transformation_targets(matched_gt, anchors)
-        >>> # regression_targets.shape = (16650, 4)
-        >>> # Only targets for positive anchors (labels==1) will be used in loss
-    
-    Training Benefits:
-        1. **Normalized targets**: tx, ty typically in range [-1, 1] for well-matched pairs
-        2. **Bounded values**: tw, th typically in range [-1, 1] for reasonable size changes
-        3. **Symmetric**: Doubling and halving have same magnitude (opposite sign)
-        4. **Smooth gradients**: No discontinuities or extreme values
-    
-    Note:
-        - The function assumes valid boxes (x2 > x1, y2 > y1)
-        - No clipping is applied to the targets - extreme values may occur for
-          poorly matched anchor-GT pairs
-        - During training, only positive anchors' targets are used in the loss
     """
     #get center x, center y, w, h from anchors (x1, y1, x2, y2) coordinates
     widths = anchors_or_proposals[:, 2] - anchors_or_proposals[:, 0]
@@ -438,35 +301,6 @@ def sample_positive_negative(labels: torch.Tensor, positive_count: int, total_co
         2. **Sample positives**: Randomly select min(num_positive_available, positive_count)
         3. **Fill with negatives**: Use remaining budget for negative samples
         4. **Random selection**: Use random permutation for unbiased sampling
-    
-    Example:
-        >>> # Typical RPN scenario with class imbalance
-        >>> labels = torch.tensor([1., 0., 0., -1., 0., 1., 0., 0., -1., 0., ...])
-        >>> # Assume: 150 positive, 16000 negative, 500 ignored out of 16650 total
-        >>> neg_mask, pos_mask = sample_positive_negative(labels, 128, 256)
-        >>> 
-        >>> # Expected behavior:
-        >>> pos_mask.sum()  # 128 (all available positives selected)
-        >>> neg_mask.sum()  # 128 (256 - 128 = 128 negatives)
-        >>> 
-        >>> # Edge case: Few positives available
-        >>> labels_few_pos = torch.zeros(16650)  # All negative
-        >>> labels_few_pos[:50] = 1.0  # Only 50 positives
-        >>> neg_mask, pos_mask = sample_positive_negative(labels_few_pos, 128, 256)
-        >>> pos_mask.sum()  # 50 (all available)
-        >>> neg_mask.sum()  # 206 (256 - 50 = 206 negatives)
-    
-    Implementation Details:
-        - Uses torch.randperm for efficient random sampling without replacement
-        - Returns boolean masks instead of indices for easier indexing
-        - Handles edge cases gracefully (e.g., insufficient anchors)
-        - Ignored anchors (label == -1) are never sampled
-    
-    Why Balanced Sampling?
-        1. **Class imbalance**: ~98% of anchors are typically background
-        2. **Gradient stability**: Prevents background loss from dominating
-        3. **Faster convergence**: Focus on informative examples
-        4. **Better performance**: Improves detection accuracy
     """
     positive = torch.where(labels >= 1)[0] # foreground anchors
     negative = torch.where(labels == 0)[0] # background anchors
@@ -505,15 +339,15 @@ class RegionProposalNetwork(nn.Module):
         their "objectness" scores (probability of containing an object).
         
         Architecture:
-        1. Shared 3×3 conv layer for feature extraction at each location
-        2. Two parallel 1×1 conv heads:
+        1. Shared 3x3 conv layer for feature extraction at each location
+        2. Two parallel 1x1 conv heads:
         - Classification head: Predicts objectness score for each anchor
         - Regression head: Predicts bounding box refinements (Δx, Δy, Δw, Δh)
         
         For each spatial location in the feature map, the network predicts:
         - K objectness scores (one per anchor)
-        - K×4 regression parameters (4 per anchor: tx, ty, tw, th)
-        where K = len(scales) × len(aspect_ratios) = 9 anchors per location
+        - Kx4 regression parameters (4 per anchor: tx, ty, tw, th)
+        where K = len(scales) x len(aspect_ratios) = 9 anchors per location
         
         Args:
             in_channels (int, optional): Number of input channels from the backbone
@@ -525,32 +359,20 @@ class RegionProposalNetwork(nn.Module):
             aspect_ratios (list): Height/width ratios [0.5, 1, 2] corresponding to
                 rectangular anchors (1:2, 1:1, 2:1).
             num_anchors (int): Number of anchors per location (should be 9).
-            rpn_conv (Conv2d): 3×3 conv layer that processes the feature map to
+            rpn_conv (Conv2d): 3x3 conv layer that processes the feature map to
                 extract spatial features for proposal generation.
-            classification_layer (Conv2d): 1×1 conv that outputs K objectness scores
+            classification_layer (Conv2d): 1x1 conv that outputs K objectness scores
                 per location. Uses K outputs instead of 2K because:
                 - Output represents P(foreground) directly
                 - P(background) = 1 - P(foreground) is implicit
                 - Reduces parameters and computation
-            bbox_regressor_layer (Conv2d): 1×1 conv that outputs 4K values per
+            bbox_regressor_layer (Conv2d): 1x1 conv that outputs 4K values per
                 location for refining anchor boxes into proposals.
         
-        Output shapes (for feature map of size H×W):
+        Output shapes (for feature map of size HxW):
             - Classification: (B, K, H, W) - objectness scores
-            - Regression: (B, K×4, H, W) - box refinements
+            - Regression: (B, Kx4, H, W) - box refinements
         
-        Example:
-            >>> rpn = RegionProposalNetwork(in_channels=512)
-            >>> feature_map = torch.randn(1, 512, 37, 50)  # From backbone
-            >>> # After forward pass:
-            >>> # cls_scores: (1, 9, 37, 50) - 9 objectness scores per location
-            >>> # bbox_deltas: (1, 36, 37, 50) - 36 = 9×4 regression params
-        
-        Note:
-            The regression parameters (tx, ty, tw, th) are not absolute coordinates
-            but transformations to be applied to anchor boxes:
-            - tx, ty: center shifts normalized by anchor width/height
-            - tw, th: log-space width/height scaling factors
         """
         
         super(RegionProposalNetwork, self).__init__()
@@ -595,7 +417,7 @@ class RegionProposalNetwork(nn.Module):
         The anchors are generated such that:
         - Each feature map cell corresponds to multiple anchors (e.g., 9 anchors)
         - Anchors are placed at regular intervals determined by the stride
-        - All anchors maintain constant area at each scale (width × height = scale²)
+        - All anchors maintain constant area at each scale (width x height = scale²)
         
         Args:
             image (torch.Tensor): Original input image. Shape: (B, C, H, W), e.g., (1, 3, 600, 800)
@@ -605,29 +427,12 @@ class RegionProposalNetwork(nn.Module):
         
         Returns:
             torch.Tensor: All anchor boxes in [x1, y1, x2, y2] format. 
-                Shape: (num_anchors, 4) where num_anchors = H_feat × W_feat × num_base_anchors
-                Example: (37 × 50 × 9, 4) = (16650, 4)
+                Shape: (num_anchors, 4) where num_anchors = H_feat x W_feat x num_base_anchors
+                Example: (37 x 50 x 9, 4) = (16650, 4)
         
         Attributes used from self:
             scales (list): Anchor scales (e.g., [128, 256, 512])
             aspect_ratios (list): Height/width ratios (e.g., [0.5, 1.0, 2.0])
-        
-        Example:
-            >>> # With 3 scales and 3 aspect ratios = 9 base anchors per location
-            >>> self.scales = [128, 256, 512]
-            >>> self.aspect_ratios = [0.5, 1.0, 2.0]
-            >>> image = torch.randn(1, 3, 600, 800)
-            >>> feature_map = torch.randn(1, 512, 37, 50)
-            >>> anchors = generate_anchors(image, feature_map)
-            >>> # anchors.shape = (16650, 4)  # 37×50×9 anchors total
-            >>> # Each anchor: [x1, y1, x2, y2] in image coordinates
-        
-        Note:
-            - Stride is computed as image_size / feature_map_size (e.g., 800/50 = 16)
-            - Anchors are shifted by (i×stride_h, j×stride_w) for grid position (i,j)
-            - The implementation places anchor centers at the top-left corner of each
-            feature map cell rather than the cell center
-            - All coordinates are in the original image space, not feature map space
         """
         grid_h, grid_w = feature_map.shape[-2:] # feature map height and width
         image_h, image_w = image.shape[-2:] # image height and width
@@ -721,13 +526,6 @@ class RegionProposalNetwork(nn.Module):
                     these are placeholder values (copies of gt_box[0]) that won't be
                     used during training.
         
-        Example:
-            >>> anchors = torch.tensor([[10, 10, 20, 20], [30, 30, 40, 40], ...])  # Shape: (16650, 4)
-            >>> gt_boxes = torch.tensor([[15, 15, 25, 25], [35, 35, 45, 45], ...])  # Shape: (6, 4)
-            >>> labels, matched_boxes = assign_targets_to_anchors(anchors, gt_boxes)
-            >>> # labels[i] = 1.0 if anchor[i] matches an object (IoU >= 0.7)
-            >>> # labels[i] = 0.0 if anchor[i] is background (IoU < 0.3)
-            >>> # labels[i] = -1.0 if anchor[i] is ignored (0.3 <= IoU < 0.7)
         """
         
         # get IoU matrix with shape (gt_boxes, num_anchors)
@@ -762,7 +560,7 @@ class RegionProposalNetwork(nn.Module):
         best_match_gt_index[bellow_low_threshold] = -1 # -1 is background
         best_match_gt_index[between_threshold] = -2 # -2 is ignored
         
-        # *LOW QUALITY POSITIVE anchor boxes process
+        # LOW QUALITY POSITIVE anchor boxes process
         # Those low quality positive anchors are between 0.3 and 0.7 but have high threashold 
         #
         # for each gt box we are finding the maximum IoU value in which this gt box has with any anchor
@@ -777,7 +575,7 @@ class RegionProposalNetwork(nn.Module):
         pred_inds_to_update = gt_pred_pair_with_highest_iou[1]
         best_match_gt_index[pred_inds_to_update] = best_match_gt_idx_pre_threshold[pred_inds_to_update] # keep low quality positive anchors in best_match_gt_index
         
-        # *Seting regression targets for the anchors 
+        # Seting regression targets for the anchors 
         # due to clamp, all -1 or -2 anchors will be assigned as background (background is treated as 0'th anchor)
         # Example
         # If gt_boxes is:
@@ -828,7 +626,7 @@ class RegionProposalNetwork(nn.Module):
         
         Args:
             proposals (torch.Tensor): Raw proposal boxes from RPN regression. 
-                Shape: (N, 4) where N = H_feat × W_feat × num_anchors (e.g., 16650)
+                Shape: (N, 4) where N = H_feat x W_feat x num_anchors (e.g., 16650)
                 Each row contains [x1, y1, x2, y2] in image coordinates.
                 These are the transformed anchor boxes after applying predicted deltas.
             
@@ -839,7 +637,7 @@ class RegionProposalNetwork(nn.Module):
             
             image_shape (Tuple[int, int]): Original input image dimensions as (height, width).
                 Used to clip proposals to valid image boundaries.
-                Example: (600, 800) for a 600×800 image.
+                Example: (600, 800) for a 600x800 image.
         
         Returns:
             Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
@@ -850,56 +648,6 @@ class RegionProposalNetwork(nn.Module):
                 Shape: (K,) matching the number of filtered proposals.
                 Values are in range [0, 1] after sigmoid activation.
         
-        Algorithm Details:
-            1. **Pre-NMS Top-K Selection (K=10000)**:
-            - Applies sigmoid to convert logits to probabilities
-            - Selects top 10000 proposals by objectness score
-            - Rationale: Reduces NMS computational cost from O(N²) to O(10000²)
-            
-            2. **Boundary Clipping**:
-            - Clips all proposal coordinates to [0, image_width] and [0, image_height]
-            - Prevents invalid boxes from being processed downstream
-            - Note: Doesn't remove tiny boxes, just clips coordinates
-            
-            3. **Non-Maximum Suppression (IoU threshold=0.7)**:
-            - Removes redundant proposals that significantly overlap
-            - Uses relatively high threshold (0.7) to be conservative
-            - Rationale: Better to keep slightly redundant proposals than miss objects
-            
-            4. **Post-NMS Top-K Selection (K=2000)**:
-            - Selects top 2000 proposals from NMS survivors
-            - Sorts by objectness score to prioritize high-confidence proposals
-            - Rationale: Balances recall with computational efficiency in RCNN stage
-
-        Example:
-        >>> # Typical usage in RPN forward pass
-        >>> proposals = apply_regression_pred_to_anchors(box_deltas, anchors)
-        >>> # proposals.shape = (16650, 4)
-        >>> classification_scores = rpn_classifier(feature_map).reshape(-1)
-        >>> # classification_scores.shape = (16650,)
-        >>> 
-        >>> filtered_proposals, filtered_scores = filter_proposals(
-        ...     proposals, classification_scores, image.shape[-2:]
-        ... )
-        >>> # filtered_proposals.shape = (2000, 4) or less
-        >>> # filtered_scores are sorted: filtered_scores[0] >= filtered_scores[1] >= ...
-        
-        Implementation Notes:
-            - The function creates a boolean mask (`keep_mask`) but doesn't use it directly;
-            instead uses the indices from NMS
-            - Sorting after NMS ensures proposals are ordered by confidence, which can
-            improve performance in the second stage
-            - The 10000/2000 thresholds are hyperparameters that can be tuned:
-            * Larger values: Better recall but slower
-            * Smaller values: Faster but might miss objects
-            - No filtering of small boxes is performed (unlike some implementations)
-            as this is handled implicitly by the objectness scores
-        
-        Performance Considerations:
-            - Pre-NMS filtering is crucial: Without it, NMS on 50×37×9=16650 boxes
-            would require ~139M IoU computations
-            - torchvision.ops.nms is highly optimized (uses C++/CUDA kernels)
-            - Post-NMS sorting has negligible cost compared to NMS itself
         """
         #Pre NMS filtering
         classification_scores = classification_scores.reshape(-1) # flatten proposal classification scores
@@ -951,15 +699,15 @@ class RegionProposalNetwork(nn.Module):
 
         Detailed Algorithm Flow:
     
-        1. **Feature Extraction** (3×3 conv + ReLU):
+        1. **Feature Extraction** (3x3 conv + ReLU):
             
-        2. **Parallel Predictions** (1×1 convs):
+        2. **Parallel Predictions** (1x1 convs):
 
             
         3. **Anchor Generation**:
-            - Creates K anchors at each of H_feat × W_feat locations
-            - Total anchors = H_feat × W_feat × K (e.g., 37×50×9 = 16,650)
-            - Anchors have 3 scales × 3 aspect ratios = 9 variants per location
+            - Creates K anchors at each of H_feat x W_feat locations
+            - Total anchors = H_feat x W_feat x K (e.g., 37x50x9 = 16,650)
+            - Anchors have 3 scales x 3 aspect ratios = 9 variants per location
             
         4. **Proposal Generation**:
             - Applies predicted deltas to anchors: proposals = transform(anchors, deltas)
@@ -986,7 +734,7 @@ class RegionProposalNetwork(nn.Module):
                 Shape: (B, C_feat, H_feat, W_feat)
                 - B: Batch size (must match image batch size)
                 - C_feat: Feature channels (e.g., 512 for VGG, 256/512/1024/2048 for ResNet)
-                - H_feat, W_feat: Spatial dimensions (e.g., 37×50 for 600×800 image with stride 16)
+                - H_feat, W_feat: Spatial dimensions (e.g., 37x50 for 600x800 image with stride 16)
                 This is the main input that RPN processes to generate proposals.
                 
             target (Dict[str, torch.Tensor], optional): Ground truth annotations for training.
