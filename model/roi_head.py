@@ -6,7 +6,7 @@ from typing import Tuple
 from .rpn import get_iou, sample_positive_negative, boxes_to_transformation_targets, apply_regression_pred_to_anchors_or_proposals, clamp_boxes_to_image_boundary
 
 class ROIHead(nn.Module):
-    def __init__(self, num_classes = 21, in_channels = 512):
+    def __init__(self,  model_config, num_classes, in_channels):
         """
         Initializes the Region of Interest (ROI) Head for a Faster R-CNN model.
 
@@ -44,9 +44,19 @@ class ROIHead(nn.Module):
         """
         super(ROIHead, self).__init__()
         self.num_classes = num_classes
-        self.pool_size = 7 # output size of pooling layer
-        self.fc_inner_dim = 1024 # dimension of FC layers
-        self.low_score_threshold = 0.05
+        self.pool_size = model_config['roi_pool_size'] # output size of pooling layer (default = 7)
+        self.fc_inner_dim = model_config['fc_inner_dim'] # dimension of FC layers (default = 1024)
+        
+        self.roi_batch_size = model_config['roi_batch_size'] # total batch for sampling positive and proposals boxes (default = 128)
+        self.roi_pos_count = int(model_config['roi_pos_fraction'] * self.roi_batch_size) # total of positive proposals in sampling (default = 128 * 0.25 = 32) 
+        #Note: roi_pos_fraction is the fraction of positive boxes in roi_batch_size
+
+        self.iou_threshold = model_config['roi_iou_threshold'] # threshold that defines background proposal (default = 0.5)
+        self.low_bg_iou = model_config['roi_low_bg_iou'] # threshold that defines low quality background proposals (default = 0.0)
+        self.nms_threshold = model_config['roi_nms_threshold'] # threshold for NMS in filter_proposals function (default = 0.7)
+        self.topK_detections = model_config['roi_topk_detections'] #Post NMS topk boxes in filter_proposals function (default = 100)
+        self.low_score_threshold = model_config['roi_score_threshold'] # threshold used in filter_predictions to remove low scoring proposals (default = 0.5)
+
         #1st fc after pooling
         self.fc6 = nn.Linear(
             in_channels*self.pool_size*self.pool_size, # input example (512*7*7, )   
@@ -71,6 +81,12 @@ class ROIHead(nn.Module):
             self.num_classes * 4 
         )
         
+        torch.nn.init.normal_(self.cls_layer.weight, std=0.01)
+        torch.nn.init.constant_(self.cls_layer.bias, 0)
+
+        torch.nn.init.normal_(self.bbox_reg_layer.weight, std=0.01)
+        torch.nn.init.constant_(self.bbox_reg_layer.bias, 0)
+  
     def assign_target_to_proposals(self, proposals: torch.Tensor, gt_boxes: torch.Tensor, gt_labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:        
         """Assign ground truth boxes and labels to region proposals based on IoU overlap.
     
@@ -123,17 +139,22 @@ class ROIHead(nn.Module):
         iou_matrix = get_iou(gt_boxes, proposals) # compute IoU bettwen proposals and gt
         best_match_iou, best_match_gt_idx = iou_matrix.max(dim = 0) # get the gt box with best IoU in respect to all proposals
             
-        below_low_threshold = best_match_iou < 0.5 # mask with proposals that have IoU below 0.5
+        background_proposals = (best_match_iou < self.iou_threshold) & (best_match_iou >= self.low_bg_iou)# mask with proposals that have IoU below 0.5
+        ignored_proposals = best_match_iou < self.low_bg_iou
         
-        best_match_gt_idx[below_low_threshold] = -1 # background proposals (IoU less than threshold) have -1 index
+        best_match_gt_idx[background_proposals] = -1 # background proposals (IoU less than threshold) have -1 index
+        best_match_gt_idx[ignored_proposals] = -2 # low quality background proposals have -2 index
+        
         matched_gt_boxes_for_proposals = gt_boxes[best_match_gt_idx.clamp(min = 0)] # assign a gt box to each proposal based in IoU
         
         labels = gt_labels[best_match_gt_idx.clamp(min=0)]# assing a gt label to each proposal based in IoU 
         labels = labels.to(dtype=torch.int64)
         
-        # the  for background proposals is 0
-        background_proposal = best_match_gt_idx == -1
-        labels[background_proposal] = 0
+        # Update background proposals to be of label 0(background)
+        labels[background_proposals] = 0
+        
+        # Set all to be ignored anchor labels as -1(will be ignored)
+        labels[ignored_proposals] = -1
         
         return labels, matched_gt_boxes_for_proposals # both have shape (2000,) and (2000, 4)
     
@@ -178,10 +199,12 @@ class ROIHead(nn.Module):
         keep = torch.where(pred_scores > self.low_score_threshold)[0]
         pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
         
-        # remove small boxes (keep boxes with height and width greater than 1)
-        min_size = 1
+        # remove small boxes (keep boxes with height and width greater than 16)
+        # Hyperparameter???
+        min_size = 16
         ws, hs = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1] 
-        keep = torch.where((ws >= min_size) & (hs <= 1))[0]
+        keep = (ws >= min_size) & (hs >= min_size)
+        keep = torch.where(keep)[0]
         pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
 
         # Class wise NMS
@@ -194,7 +217,7 @@ class ROIHead(nn.Module):
             curr_keep_indices = torchvision.ops.nms(
                 pred_boxes[curr_indices],
                 pred_scores[curr_indices],
-                0.5
+                self.nms_threshold
             )
             keep_mask[curr_indices[curr_keep_indices]] = True
         keep_indices = torch.where(keep_mask)[0]   
@@ -205,7 +228,7 @@ class ROIHead(nn.Module):
             )[1]]
         
         #return only top 100 detections for each image
-        keep = post_nms_keep_indices[:100]
+        keep = post_nms_keep_indices[:self.topK_detections]
         pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
         return pred_boxes, pred_scores, pred_labels
 
@@ -249,6 +272,9 @@ class ROIHead(nn.Module):
             - During inference: `{"boxes": Tensor, "scores": Tensor, "labels": Tensor}`
         """
         if self.training and target is not None:
+            # Add ground truth to proposals
+            proposals = torch.cat([proposals, target['bboxes'][0]], dim=0)
+            
             gt_boxes = target["bboxes"][0] # shape example (6, 4)
             gt_labels = target["labels"][0] # shape example (6,)
 
@@ -256,7 +282,7 @@ class ROIHead(nn.Module):
             labels, matched_gt_boxes_for_proposals = self.assign_target_to_proposals(proposals, gt_boxes, gt_labels)
 
             # Sample positive and negative proposals
-            sampled_neg_idx_mask, sampled_pos_idx_mask = sample_positive_negative(labels, positive_count=32, total_count=128)
+            sampled_neg_idx_mask, sampled_pos_idx_mask = sample_positive_negative(labels, positive_count=self.roi_pos_count, total_count=self.roi_batch_size)
             sampled_idxs = torch.where(sampled_pos_idx_mask | sampled_neg_idx_mask)[0] # union of positive and negative samples
             
             # Get only the sampled proposals for training
@@ -271,14 +297,20 @@ class ROIHead(nn.Module):
         # ROI pooling
         # spatial scale for ROI pooling (how much downscaled the feature map is related to image)
         # for vgg this is 1/16
-        spatial_scale = 0.0625
+        size = feature_map.shape[-2:]
+        possible_scales = []
+        for s1, s2 in zip(size, image_shape):
+            approx_scale = float(s1) / float(s2)
+            scale = 2 ** float(torch.tensor(approx_scale).log2().round())
+            possible_scales.append(scale)
+        assert possible_scales[0] == possible_scales[1]
         
         # proposal_roi_pool_feats -> (number_proposals, 512, 7, 7)
         proposal_roi_pool_feats = torchvision.ops.roi_pool(
             feature_map, # eg.: (1, 512, 37, 50)
             [proposals], # (number_proposals, 4)
             output_size=self.pool_size, # 7
-            spatial_scale=spatial_scale
+            spatial_scale=possible_scales[0]
         )
         
         # flatten starting by 1st dimension therefore the proposal_roi_pool_feats shape will be (number_proposals, 512*7*7)
