@@ -4,35 +4,7 @@ import torch
 import torchvision
 from .rpn import RegionProposalNetwork 
 from .roi_head import ROIHead
-
-def transform_boxes_to_original_size(boxes: torch.Tensor, new_size: torch.Tensor, original_size: torch.Tensor) -> torch.Tensor:
-    """
-    Transforms bounding box coordinates from a resized image scale back to the original image scale.
-
-    Args:
-        boxes (torch.Tensor): A tensor of shape [N, 4] containing the bounding boxes
-                              in (xmin, ymin, xmax, ymax) format, corresponding to the resized image.
-        new_size (torch.Tensor): A tensor representing the size of the resized image [height, width].
-        original_size (torch.Tensor): A tensor representing the size of the original image [height, width].
-
-    Returns:
-        torch.Tensor: A tensor of shape [N, 4] with bounding boxes scaled to the original image dimensions.
-    """
-    # Calculate h and w scales [original_image_h/resized_image_h, original_image_w/resized_image_w]
-    ratios = [
-            torch.tensor(s_orig, dtype=torch.float32, device=boxes.device) / torch.tensor(s, dtype=torch.float32, device=boxes.device) 
-            for s, s_orig in zip(new_size, original_size)
-        ]
-    
-    # resize the box coordinates accordingly to image resize scale
-    ratio_height, ratio_width = ratios
-    xmin, ymin, xmax, ymax = boxes.unbind(1)
-    xmin = xmin * ratio_width
-    xmax = xmax * ratio_width
-    ymin = ymin * ratio_height
-    ymax = ymax * ratio_height
-    
-    return torch.stack((xmin, ymin, xmax, ymax), dim=1)
+from .utils import transform_boxes_to_original_size
 
 class FasterRCNN(nn.Module):
     def __init__(self, model_config, num_classes):
@@ -54,12 +26,12 @@ class FasterRCNN(nn.Module):
         vgg16 = torchvision.models.vgg16(pretrained=True)
         self.backbone = vgg16.features[:-1] # removing last max pooling layers and cls layers
         
-        self.rpn = RegionProposalNetwork(in_channels=model_config['backbone_out_channels'],
-                                         scales=model_config['scales'],
-                                         aspect_ratios=model_config['aspect_ratios'],
+        self.rpn = RegionProposalNetwork(in_channels=model_config["backbone_out_channels"],
+                                         scales=model_config["scales"],
+                                         aspect_ratios=model_config["aspect_ratios"],
                                          model_config=model_config)
         
-        self.roi_head = ROIHead(model_config, num_classes, in_channels=model_config['backbone_out_channels'])
+        self.roi_head = ROIHead(model_config, num_classes, in_channels=model_config["backbone_out_channels"])
         
         # Freeze the first few layers of VGG16
         for layer in self.backbone[:10]:
@@ -72,8 +44,8 @@ class FasterRCNN(nn.Module):
         self.image_std = [0.229, 0.224, 0.225]
         
         # resize the smaller dimension to min_size (600 pixels) and also cap the larger dimension to max_size (1000 pixels)
-        self.min_size = model_config['min_im_size']
-        self.max_size = model_config['max_im_size']
+        self.min_size = model_config["min_im_size"]
+        self.max_size = model_config["max_im_size"]
         
     def normalize_resize_image_and_boxes(self, image: torch.Tensor, bboxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -155,7 +127,7 @@ class FasterRCNN(nn.Module):
         Args:
             image (torch.Tensor): The input image tensor of shape [1, C, H, W].
             target (dict, optional): A dictionary containing ground-truth data, primarily
-                                     'bboxes' and 'labels'. Required for training. Defaults to None.
+                                     "bboxes" and "labels". Required for training. Defaults to None.
 
         Returns:
             Tuple[dict, dict]: A tuple containing two dictionaries:

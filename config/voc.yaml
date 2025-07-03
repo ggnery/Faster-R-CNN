@@ -13,6 +13,8 @@ model_params:
   max_im_size : 1000
   backbone_out_channels : 512
   fc_inner_dim : 1024
+  rpn_min_size: 16
+  roi_min_size: 16
   rpn_bg_threshold : 0.3
   rpn_fg_threshold : 0.7
   rpn_nms_threshold : 0.7
@@ -23,13 +25,15 @@ model_params:
   rpn_batch_size : 256
   rpn_pos_fraction : 0.5
   roi_iou_threshold : 0.5
-  roi_low_bg_iou : 0.0 # increase it to 0.1 for hard negative
+  roi_low_bg_iou : 0.0 # use 0.1 for hard negative
   roi_pool_size : 7
   roi_nms_threshold : 0.3
   roi_topk_detections : 100
   roi_score_threshold : 0.05
   roi_batch_size : 128
   roi_pos_fraction : 0.25
+  faster_image_mean: [0.485, 0.456, 0.406]
+  faster_image_std: [0.229, 0.224, 0.225]
 
 train_params:
   task_name: 'voc'

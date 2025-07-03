@@ -3,7 +3,7 @@ import torchvision
 
 from torch import nn
 from typing import Tuple
-from .rpn import get_iou, sample_positive_negative, boxes_to_transformation_targets, apply_regression_pred_to_anchors_or_proposals, clamp_boxes_to_image_boundary
+from .utils import get_iou, sample_positive_negative, boxes_to_transformation_targets, apply_regression_pred_to_anchors_or_proposals, clamp_boxes_to_image_boundary
 
 class ROIHead(nn.Module):
     def __init__(self,  model_config, num_classes, in_channels):
@@ -44,18 +44,20 @@ class ROIHead(nn.Module):
         """
         super(ROIHead, self).__init__()
         self.num_classes = num_classes
-        self.pool_size = model_config['roi_pool_size'] # output size of pooling layer (default = 7)
-        self.fc_inner_dim = model_config['fc_inner_dim'] # dimension of FC layers (default = 1024)
+        self.pool_size = model_config["roi_pool_size"] # output size of pooling layer (default = 7)
+        self.fc_inner_dim = model_config["fc_inner_dim"] # dimension of FC layers (default = 1024)
         
-        self.roi_batch_size = model_config['roi_batch_size'] # total batch for sampling positive and proposals boxes (default = 128)
-        self.roi_pos_count = int(model_config['roi_pos_fraction'] * self.roi_batch_size) # total of positive proposals in sampling (default = 128 * 0.25 = 32) 
+        self.roi_batch_size = model_config["roi_batch_size"] # total batch for sampling positive and proposals boxes (default = 128)
+        self.roi_pos_count = int(model_config["roi_pos_fraction"] * self.roi_batch_size) # total of positive proposals in sampling (default = 128 * 0.25 = 32) 
         #Note: roi_pos_fraction is the fraction of positive boxes in roi_batch_size
 
-        self.iou_threshold = model_config['roi_iou_threshold'] # threshold that defines background proposal (default = 0.5)
-        self.low_bg_iou = model_config['roi_low_bg_iou'] # threshold that defines low quality background proposals (default = 0.0)
-        self.nms_threshold = model_config['roi_nms_threshold'] # threshold for NMS in filter_proposals function (default = 0.7)
-        self.topK_detections = model_config['roi_topk_detections'] #Post NMS topk boxes in filter_proposals function (default = 100)
-        self.low_score_threshold = model_config['roi_score_threshold'] # threshold used in filter_predictions to remove low scoring proposals (default = 0.5)
+        self.iou_threshold = model_config["roi_iou_threshold"] # threshold that defines background proposal (default = 0.5)
+        self.low_bg_iou = model_config["roi_low_bg_iou"] # threshold that defines low quality background proposals (default = 0.0)
+        self.nms_threshold = model_config["roi_nms_threshold"] # threshold for NMS in filter_predictions function (default = 0.7)
+        self.topK_detections = model_config["roi_topk_detections"] #Post NMS topk boxes in filter_predictions function (default = 100)
+        self.low_score_threshold = model_config["roi_score_threshold"] # threshold used in filter_predictions to remove low scoring proposals (default = 0.5)
+
+        self.min_size = model_config["roi_min_size"] # min h and w in filter_predictions function (default = 16)
 
         #1st fc after pooling
         self.fc6 = nn.Linear(
@@ -200,8 +202,7 @@ class ROIHead(nn.Module):
         pred_boxes, pred_scores, pred_labels = pred_boxes[keep], pred_scores[keep], pred_labels[keep]
         
         # remove small boxes (keep boxes with height and width greater than 16)
-        # Hyperparameter???
-        min_size = 16
+        min_size = self.min_size
         ws, hs = pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1] 
         keep = (ws >= min_size) & (hs >= min_size)
         keep = torch.where(keep)[0]
@@ -273,7 +274,7 @@ class ROIHead(nn.Module):
         """
         if self.training and target is not None:
             # Add ground truth to proposals
-            proposals = torch.cat([proposals, target['bboxes'][0]], dim=0)
+            proposals = torch.cat([proposals, target["bboxes"][0]], dim=0)
             
             gt_boxes = target["bboxes"][0] # shape example (6, 4)
             gt_labels = target["labels"][0] # shape example (6,)
@@ -344,7 +345,7 @@ class ROIHead(nn.Module):
                 box_transform_pred[fg_proposals_idxs, fg_class_labels],
                 regression_targets[fg_proposals_idxs],
                 beta=1/9,
-                reduction='sum'
+                reduction="sum"
             )
             localization_loss = localization_loss/labels.numel() # normalizing localization loss
             

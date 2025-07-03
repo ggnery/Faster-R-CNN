@@ -15,7 +15,7 @@ from dataset.voc import VOCDataset
 from torch.utils.data.dataloader import DataLoader
 
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def get_iou(det, gt):
     det_x1, det_y1, det_x2, det_y2 = det
@@ -37,11 +37,11 @@ def get_iou(det, gt):
     return iou
 
 
-def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
+def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method="area"):
     # det_boxes = [
     #   {
-    #       'person' : [[x1, y1, x2, y2, score], ...],
-    #       'car' : [[x1, y1, x2, y2, score], ...]
+    #       "person" : [[x1, y1, x2, y2, score], ...],
+    #       "car" : [[x1, y1, x2, y2, score], ...]
     #   }
     #   {det_boxes_img_2},
     #   ...
@@ -50,8 +50,8 @@ def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
     #
     # gt_boxes = [
     #   {
-    #       'person' : [[x1, y1, x2, y2], ...],
-    #       'car' : [[x1, y1, x2, y2], ...]
+    #       "person" : [[x1, y1, x2, y2], ...],
+    #       "car" : [[x1, y1, x2, y2], ...]
     #   },
     #   {gt_boxes_img_2},
     #   ...
@@ -118,7 +118,7 @@ def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
         recalls = tp / np.maximum(num_gts, eps)
         precisions = tp / np.maximum((tp + fp), eps)
 
-        if method == 'area':
+        if method == "area":
             recalls = np.concatenate(([0.0], recalls, [1.0]))
             precisions = np.concatenate(([0.0], precisions, [0.0]))
             
@@ -131,7 +131,7 @@ def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
             i = np.where(recalls[1:] != recalls[:-1])[0]
             # Add the rectangular areas to get ap
             ap = np.sum((recalls[i + 1] - recalls[i]) * precisions[i + 1])
-        elif method == 'interp':
+        elif method == "interp":
             ap = 0.0
             for interp_pt in np.arange(0, 1 + 1E-3, 0.1):
                 # Get precision values for recall values >= interp_pt
@@ -142,7 +142,7 @@ def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
                 ap += prec_interp_pt
             ap = ap / 11.0
         else:
-            raise ValueError('Method can only be area or interp')
+            raise ValueError("Method can only be area or interp")
         if num_gts > 0:
             aps.append(ap)
             all_aps[label] = ap
@@ -155,7 +155,7 @@ def compute_map(det_boxes, gt_boxes, iou_threshold=0.5, method='area'):
 
 def load_model_and_dataset(args):
     # Read the config file 
-    with open(args.config_path, 'r') as file:
+    with open(args.config_path, "r") as file:
         try:
             config = yaml.safe_load(file)
         except yaml.YAMLError as exc:
@@ -163,25 +163,25 @@ def load_model_and_dataset(args):
     print(config)
     
     
-    dataset_config = config['dataset_params']
-    model_config = config['model_params']
-    train_config = config['train_params']
+    dataset_config = config["dataset_params"]
+    model_config = config["model_params"]
+    train_config = config["train_params"]
     
-    seed = train_config['seed']
+    seed = train_config["seed"]
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
-    if device == 'cuda':
+    if device == "cuda":
         torch.cuda.manual_seed_all(seed)
     
-    voc = VOCDataset('test', im_dir=dataset_config['im_test_path'], ann_dir=dataset_config['ann_test_path'])
+    voc = VOCDataset("test", im_dir=dataset_config["im_test_path"], ann_dir=dataset_config["ann_test_path"])
     test_dataset = DataLoader(voc, batch_size=1, shuffle=False)
     
-    faster_rcnn_model = FasterRCNN(model_config, num_classes=dataset_config['num_classes'])
+    faster_rcnn_model = FasterRCNN(model_config, num_classes=dataset_config["num_classes"])
     faster_rcnn_model.eval()
     faster_rcnn_model.to(device)
-    faster_rcnn_model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
-                                                              train_config['ckpt_name']),
+    faster_rcnn_model.load_state_dict(torch.load(os.path.join(train_config["task_name"],
+                                                              train_config["ckpt_name"]),
                                                  map_location=device))
     return faster_rcnn_model, voc, test_dataset
 
@@ -214,8 +214,8 @@ def draw_boxes(image, boxes, color, get_text, path):
     cv2.imwrite(path, image)
 
 def infer(args):
-    if not os.path.exists('samples'):
-        os.mkdir('samples')
+    if not os.path.exists("samples"):
+        os.mkdir("samples")
     faster_rcnn_model, voc, test_dataset = load_model_and_dataset(args)
     
     # Changing low score threshold for inference 
@@ -229,20 +229,20 @@ def infer(args):
         gt_im = cv2.imread(fname)
                 
         # Saving images with ground truth boxes
-        path = 'samples/output_frcnn_gt_{}.png'.format(sample_count)
-        get_text = lambda idx: voc.idx2label[target['labels'][idx].detach().cpu().item()]
-        draw_boxes(gt_im, target['bboxes'], [0, 255, 0], get_text, path)
+        path = "samples/output_frcnn_gt_{}.png".format(sample_count)
+        get_text = lambda idx: voc.idx2label[target["labels"][idx].detach().cpu().item()]
+        draw_boxes(gt_im, target["bboxes"], [0, 255, 0], get_text, path)
         
         
         # Getting predictions from trained model
         rpn_output, frcnn_output = faster_rcnn_model(im, None)
-        boxes = frcnn_output['boxes']
-        labels = frcnn_output['labels']
-        scores = frcnn_output['scores']
+        boxes = frcnn_output["boxes"]
+        labels = frcnn_output["labels"]
+        scores = frcnn_output["scores"]
         im = cv2.imread(fname)
         
         # Saving images with predicted boxes
-        path = 'samples/output_frcnn_{}.jpg'.format(sample_count)
+        path = "samples/output_frcnn_{}.jpg".format(sample_count)
         get_text = lambda idx: "{} : {:.2f}".format(voc.idx2label[labels[idx].detach().cpu().item()], scores[idx].detach().cpu().item())
         draw_boxes(im, boxes, [0, 0, 255], get_text, path)
         
@@ -254,13 +254,13 @@ def evaluate_map(args):
     for im, target, fname in tqdm(test_dataset):
         im_name = fname
         im = im.float().to(device)
-        target_boxes = target['bboxes'].float().to(device)[0]
-        target_labels = target['labels'].long().to(device)[0]
+        target_boxes = target["bboxes"].float().to(device)[0]
+        target_labels = target["labels"].long().to(device)[0]
         rpn_output, frcnn_output = faster_rcnn_model(im, None)
 
-        boxes = frcnn_output['boxes']
-        labels = frcnn_output['labels']
-        scores = frcnn_output['scores']
+        boxes = frcnn_output["boxes"]
+        labels = frcnn_output["labels"]
+        scores = frcnn_output["scores"]
         
         pred_boxes = {}
         gt_boxes = {}
@@ -283,28 +283,28 @@ def evaluate_map(args):
         gts.append(gt_boxes)
         preds.append(pred_boxes)
    
-    mean_ap, all_aps = compute_map(preds, gts, method='interp')
-    print('Class Wise Average Precisions')
+    mean_ap, all_aps = compute_map(preds, gts, method="interp")
+    print("Class Wise Average Precisions")
     for idx in range(len(voc.idx2label)):
-        print('AP for class {} = {:.4f}'.format(voc.idx2label[idx], all_aps[voc.idx2label[idx]]))
-    print('Mean Average Precision : {:.4f}'.format(mean_ap))
+        print("AP for class {} = {:.4f}".format(voc.idx2label[idx], all_aps[voc.idx2label[idx]]))
+    print("Mean Average Precision : {:.4f}".format(mean_ap))
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Arguments for faster rcnn inference')
-    parser.add_argument('--config', dest='config_path',
-                        default='config/voc.yaml', type=str)
-    parser.add_argument('--evaluate', dest='evaluate',
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Arguments for faster rcnn inference")
+    parser.add_argument("--config", dest="config_path",
+                        default="config/voc.yaml", type=str)
+    parser.add_argument("--evaluate", dest="evaluate",
                         default=False, type=bool)
-    parser.add_argument('--infer_samples', dest='infer_samples',
+    parser.add_argument("--infer_samples", dest="infer_samples",
                         default=True, type=bool)
     args = parser.parse_args()
     if args.infer_samples:
         infer(args)
     else:
-        print('Not Inferring for samples as `infer_samples` argument is False')
+        print("Not Inferring for samples as `infer_samples` argument is False")
         
     if args.evaluate:
         evaluate_map(args)
     else:
-        print('Not Evaluating as `evaluate` argument is False')
+        print("Not Evaluating as `evaluate` argument is False")
