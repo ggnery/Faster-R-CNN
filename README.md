@@ -50,7 +50,7 @@ Faster-R-CNN/
 ├── model/
 │   ├── faster_rcnn.py      # Main Faster R-CNN model
 │   ├── rpn.py              # Region Proposal Network
-│   ├── roi_head.py         # ROI Head for 
+│   ├── roi_head.py         # ROI Head 
 │   └── utils.py            # Utility functions (IoU, NMS, etc.)
 ├── dataset/
 │   └── voc.py              # VOC dataset loader
