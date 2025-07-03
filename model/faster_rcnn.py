@@ -35,7 +35,7 @@ def transform_boxes_to_original_size(boxes: torch.Tensor, new_size: torch.Tensor
     return torch.stack((xmin, ymin, xmax, ymax), dim=1)
 
 class FasterRCNN(nn.Module):
-    def __init__(self, num_classes = 21):
+    def __init__(self, model_config, num_classes):
         """
         Initializes the Faster R-CNN model.
 
@@ -48,13 +48,18 @@ class FasterRCNN(nn.Module):
                             Defaults to 21.
         """
         super(FasterRCNN, self).__init__()
+        self.model_config = model_config
         
         #Backbone is vgg16 without last max pooling layers and classification layers
         vgg16 = torchvision.models.vgg16(pretrained=True)
         self.backbone = vgg16.features[:-1] # removing last max pooling layers and cls layers
         
-        self.rpn = RegionProposalNetwork(in_channels=512)
-        self.roi_head = ROIHead(num_classes=num_classes, in_channels=512)
+        self.rpn = RegionProposalNetwork(in_channels=model_config['backbone_out_channels'],
+                                         scales=model_config['scales'],
+                                         aspect_ratios=model_config['aspect_ratios'],
+                                         model_config=model_config)
+        
+        self.roi_head = ROIHead(model_config, num_classes, in_channels=model_config['backbone_out_channels'])
         
         # Freeze the first few layers of VGG16
         for layer in self.backbone[:10]:
@@ -62,12 +67,13 @@ class FasterRCNN(nn.Module):
                 p.requires_grad = False
         
         #ImageNet mean and standard deviation used to normalize the input 
+        #Hyperparam???
         self.image_mean = [0.485, 0.456, 0.406]
         self.image_std = [0.229, 0.224, 0.225]
         
         # resize the smaller dimension to min_size (600 pixels) and also cap the larger dimension to max_size (1000 pixels)
-        self.min_size = 600
-        self.max_size = 1000
+        self.min_size = model_config['min_im_size']
+        self.max_size = model_config['max_im_size']
         
     def normalize_resize_image_and_boxes(self, image: torch.Tensor, bboxes: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -114,7 +120,7 @@ class FasterRCNN(nn.Module):
             scale_factor=scale_factor,
             mode="bilinear",
             recompute_scale_factor=True,
-            align_corners=True
+            align_corners=False
         )
         
         # Resize boxes

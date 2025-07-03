@@ -26,7 +26,7 @@ def train(args):
     print(config)
     
     dataset_config = config['dataset_params']
-    #model_config = config['model_params']
+    model_config = config['model_params']
     train_config = config['train_params']
     
     # Define initial seed
@@ -44,7 +44,7 @@ def train(args):
         )
     
     train_dataset = DataLoader(voc, batch_size=1, shuffle=True, num_workers=4)
-    faster_rcnn_model = FasterRCNN(num_classes=dataset_config["num_classes"])
+    faster_rcnn_model = FasterRCNN(model_config, num_classes=dataset_config["num_classes"])
     
     faster_rcnn_model.train() # set faster in train mode
     faster_rcnn_model.to(device)

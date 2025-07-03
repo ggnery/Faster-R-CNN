@@ -164,6 +164,7 @@ def load_model_and_dataset(args):
     
     
     dataset_config = config['dataset_params']
+    model_config = config['model_params']
     train_config = config['train_params']
     
     seed = train_config['seed']
@@ -176,7 +177,7 @@ def load_model_and_dataset(args):
     voc = VOCDataset('test', im_dir=dataset_config['im_test_path'], ann_dir=dataset_config['ann_test_path'])
     test_dataset = DataLoader(voc, batch_size=1, shuffle=False)
     
-    faster_rcnn_model = FasterRCNN(num_classes=dataset_config['num_classes'])
+    faster_rcnn_model = FasterRCNN(model_config, num_classes=dataset_config['num_classes'])
     faster_rcnn_model.eval()
     faster_rcnn_model.to(device)
     faster_rcnn_model.load_state_dict(torch.load(os.path.join(train_config['task_name'],
