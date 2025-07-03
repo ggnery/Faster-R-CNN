@@ -2,6 +2,15 @@
 
 This repository implements [Faster R-CNN](https://arxiv.org/abs/1506.01497) from scratch in PyTorch for object detection. The implementation is designed to be educational and easy to understand, providing a clean, well-documented codebase that demonstrates the core concepts of Faster R-CNN without excessive abstractions.
 
+## Sample Output by training Faster R-CNN on VOC 2007 dataset 
+Ground Truth(Left) | Prediction(right)
+</br>
+<img src="./images/output_frcnn_gt_7.png" width="300">
+<img src="./images/output_frcnn_7.jpg" width="300">
+</br>
+<img src="./images/output_frcnn_gt_9.png" width="300">
+<img src="./images/output_frcnn_9.jpg" width="300">
+
 ## 🚀 Key Features
 
 - **From Scratch Implementation**: Clean, educational implementation of Faster R-CNN architecture
